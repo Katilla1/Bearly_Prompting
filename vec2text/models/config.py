@@ -3,7 +3,7 @@ import json
 import transformers
 
 NEW_ATTRIBUTES = {
-    "embedder_torch_dtype": "float32",
+    "embedder_dtype": "float32",
 }
 
 
