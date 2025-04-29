@@ -4,8 +4,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from transformers import TFT5ForConditionalGeneration, T5Tokenizer
-from transformers.modeling_tf_outputs import TFSeq2SeqLMOutput, TFBaseModelOutput, BaseModelOutput
-
+from transformers.modeling_outputs import BaseModelOutput
 
 
 class T5SparseEncoderTF(TFT5ForConditionalGeneration):
