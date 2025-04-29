@@ -7,7 +7,10 @@ from transformers import TFT5ForConditionalGeneration, T5Tokenizer
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 
 
-class T5SparseEncoderTF(TFT5ForConditionalGeneration):
+class T5SparseEncoder(TFT5ForConditionalGeneration):
+    def __init__(self, config, mode: str = 'just_sparse'):
+        super().__init__(config)
+        self.mode = mode
     def my_encoder(self, input_ids, output_attentions=True):
         mode = self.mode
         ss = tf.shape(input_ids)
