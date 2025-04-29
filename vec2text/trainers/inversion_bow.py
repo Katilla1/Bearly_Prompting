@@ -1,20 +1,21 @@
-from typing import Dict
+from typing import Dict, Any
+import tensorflow as tf
 
-import torch
-
-from vec2text.trainers.base import BaseTrainer
+from .base_trainer_tf import BaseTrainer
 
 
 class InversionTrainerBagOfWords(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        ######################################################
+
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
 
-    def compute_metrics_func(self, eval_preds):
-        return {}  # TODO: implement additional bow metrics.
+    def compute_metrics_func(self, eval_preds) -> Dict[str, float]:
 
-    def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
+        return {}
+
+    def generate(self, inputs: Dict[str, tf.Tensor], generation_kwargs: Dict[str, Any]) -> tf.Tensor:
+
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)

@@ -4,8 +4,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import datasets
-import torch
-import torch.nn as nn
+#import torch
+#import torch.nn as nn
+import tensorflow as tf
 import transformers
 
 from vec2text.models import CorrectorEncoderModel
@@ -29,7 +30,7 @@ class Corrector(BaseTrainer):
     # TODO: don't assume that the encoder has to have the same tokenizer as the encoder_decoder
     # or embedder model.
 
-    _hypothesis_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    _hypothesis_cache: Dict[str, Tuple[tf.Tensor, tf.Tensor, tf.Tensor]]
 
     # If set, only take hypothesis if it improves our distance to ground-truth.
     return_best_hypothesis: bool = False
@@ -74,95 +75,99 @@ class Corrector(BaseTrainer):
         assert self.args.fp16 == self.inversion_trainer.args.fp16
         assert self.args.bf16 == self.inversion_trainer.args.bf16
 
-    def evaluation_loop(
-        self, dataloader: torch.utils.data.DataLoader, *args, **kwargs
-    ) -> transformers.trainer_utils.EvalLoopOutput:
+    def evaluate(
+        self,
+        eval_dataset: tf.data.Dataset = None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+        **kwargs,
+    ) -> Dict[str, float]:
         """
-        Run evaluation and returns metrics.
-
-        Override to compute ppl from eval loss.
+        Run evaluation and return metrics, then add multi-round generation metrics
+        for msmarco/nq splits.
         """
-        self.inversion_trainer.model.to(self.args.device)
+        # 1) run the standard TFTrainer.evaluate
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+            **kwargs,
+        )
 
-        metric_key_prefix = kwargs["metric_key_prefix"]
-        output = super().evaluation_loop(dataloader=dataloader, *args, **kwargs)  # type: ignore
-        if metric_key_prefix in {"eval_msmarco", "eval_nq"}:
+        # 2) on the chief process, for specific splits, run multi-round generation
+        if getattr(self.args, "process_index", 0) == 0 and metric_key_prefix in {"eval_msmarco", "eval_nq"}:
             n_rounds = 5
             self.num_gen_recursive_steps = n_rounds
-            multi_round_generation_metrics = self.eval_generation_metrics(
-                dataloader=dataloader
-            )
-            multiround_generation_metrics = {
+            gen_metrics = self.eval_generation_metrics(dataloader=eval_dataset)
+            # prefix each generated metric
+            prefixed = {
                 f"{metric_key_prefix}_{n_rounds}round_{k}": v
-                for k, v in multi_round_generation_metrics.items()
+                for k, v in gen_metrics.items()
             }
-            output.metrics.update(multiround_generation_metrics)
+            metrics.update(prefixed)
             self.num_gen_recursive_steps = 1
 
-        self.inversion_trainer.model.cpu()
-        return output
+        return metrics
+
 
     def _precompute_hypothesis_and_embedding(
         self,
-        ds_inputs: Dict[str, torch.Tensor],
+        ds_inputs: Dict[str, Any],
         collator=None,
-    ) -> Dict[str, torch.Tensor]:
-        assert not self.model.training
-        inputs = collator.tokenizer.pad(
+    ) -> Dict[str, Any]:
+        """
+        Given dataset inputs, generate a hypothesis and embedding, caching them in ds_inputs.
+        """
+        # 1) Pad inputs (TF tensors)
+        padded = collator.tokenizer.pad(
             {k: v for k, v in ds_inputs.items() if k != "labels"},
             padding=collator.padding,
             max_length=collator.max_length,
             pad_to_multiple_of=collator.pad_to_multiple_of,
-            return_tensors=collator.return_tensors,
-        ).to(self.args.device)
+            return_tensors="tf",
+        )
 
-        (
-            frozen_embeddings,
-            hypothesis_input_ids,
-            hypothesis_attention_mask,
-            hypothesis_embedding,
-        ) = self._get_hypothesis_uncached(inputs=inputs)
-        ds_inputs["frozen_embeddings"] = frozen_embeddings.cpu()
-        ds_inputs["hypothesis_embedding"] = hypothesis_embedding.cpu()
+        # 2) Generate hypothesis & embeddings
+        fe, hi, hm, he = self._get_hypothesis_uncached(inputs=padded)
 
-        # cut padding so we can batch by length later
+        # 3) Cache back into ds_inputs as numpy arrays for the HF dataset
+        ds_inputs["frozen_embeddings"] = fe.numpy()
+        ds_inputs["hypothesis_embedding"] = he.numpy()
+
+        # 4) Truncate padding so we can batch by length later
         ds_inputs["hypothesis_input_ids"] = []
         ds_inputs["hypothesis_attention_mask"] = []
-        for input_ids, attention_mask in zip(
-            hypothesis_input_ids.cpu(), hypothesis_attention_mask.cpu()
-        ):
-            num_tokens = attention_mask.sum()
-            ds_inputs["hypothesis_input_ids"].append(input_ids[: num_tokens + 1])
-            ds_inputs["hypothesis_attention_mask"].append(
-                attention_mask[: num_tokens + 1]
-            )
+        for ids, mask in zip(hi.numpy(), hm.numpy()):
+            length = int(mask.sum())
+            ds_inputs["hypothesis_input_ids"].append(ids[: length + 1])
+            ds_inputs["hypothesis_attention_mask"].append(mask[: length + 1])
+
+        # 5) (Optional) debug print
         print("input_ids[0]:", self.tokenizer.decode(ds_inputs["input_ids"][0]))
         print(
             "hypothesis_input_ids[0]:",
             self.tokenizer.decode(ds_inputs["hypothesis_input_ids"][0]),
         )
+
         return ds_inputs
 
-    def _preprocess_dataset_hypotheses(
-        self, dataset: datasets.Dataset, filter_correct_examples: bool = False
-    ) -> Tuple[datasets.Dataset, str]:
-        #
-        # In each model directory, we store a copy of the dataset with hypotheses
-        # generated by the model that's checkpointed in this directory. This
-        # won't scale well, but hopefully we don't do this with too many models,
-        # and precomputing 5M hypotheses on A100 takes ~8 hours, so they're worth
-        # storing.
-        #
-        # Note that the dataset fingerprint changes with calls to select()
-        # so we won't overwrite the big dataset files when we use tiny subsets
-        # during testing.
-        cache_dir = os.environ["VEC2TEXT_CACHE"]
-        assert os.path.exists(cache_dir)
-        ####
-        cache_path = os.path.join(cache_dir, f"{dataset._fingerprint}_hypotheses.cache")
-        if not os.path.exists(cache_path):
-            print(f"\t[{dataset.builder_name}] Saving hypotheses to path {cache_path}")
 
+    def _preprocess_dataset_hypotheses(
+        self,
+        dataset: datasets.Dataset,
+        filter_correct_examples: bool = False
+    ) -> Tuple[datasets.Dataset, str]:
+        """
+        Precompute or load cached hypotheses and embeddings for a HF dataset,
+        storing them under VEC2TEXT_CACHE.
+        """
+        cache_dir = os.environ["VEC2TEXT_CACHE"]
+        assert os.path.exists(cache_dir), f"Cache dir {cache_dir} not found"
+        cache_path = os.path.join(cache_dir, f"{dataset._fingerprint}_hypotheses.cache")
+
+        if not os.path.exists(cache_path):
+            print(f"[{dataset.builder_name}] Saving hypotheses to {cache_path}")
+            # 1) Map over the dataset to generate frozen_embeddings & hypotheses
             dataset = dataset_map_multi_worker(
                 dataset=dataset,
                 map_fn=functools.partial(
@@ -170,35 +175,37 @@ class Corrector(BaseTrainer):
                     collator=self.data_collator,
                 ),
                 batched=True,
-                batch_size=(self.args.train_batch_size * 2),
+                batch_size=self.args.train_batch_size * 2,
                 desc="Precomputing hypotheses for data",
             )
 
+            # 2) Optionally filter out examples where hypothesis == frozen embedding
             if filter_correct_examples:
-                old_length = len(dataset)
+                old_len = len(dataset)
 
                 def embedding_is_not_correct(ex):
-                    return (
-                        ~torch.isclose(
-                            ex["frozen_embeddings"].to(self.args.device),
-                            ex["hypothesis_embedding"].to(self.args.device),
-                        ).all(dim=1)
-                    ).tolist()
+                    fe = tf.convert_to_tensor(ex["frozen_embeddings"], dtype=tf.float32)
+                    he = tf.convert_to_tensor(ex["hypothesis_embedding"], dtype=tf.float32)
+                    # keep examples where not all elements are close
+                    correct_mask = tf.reduce_all(tf.math.is_close(fe, he, atol=1e-6), axis=1)
+                    return (~correct_mask).numpy().tolist()
 
                 dataset = dataset.filter(
                     embedding_is_not_correct,
                     batched=True,
                     batch_size=1024,
                 )
-                print(f"filtered {old_length} datapoints to {len(dataset)}")
+                print(f"filtered {old_len} → {len(dataset)} examples")
+
+            # 3) Save to disk for future runs
             dataset.save_to_disk(cache_path)
         else:
-            logging.info("Loading hypotheses from path %s", cache_path)
-            print(
-                f"\t[{dataset.builder_name}] Loading hypotheses from path {cache_path}"
-            )
+            logging.info("Loading hypotheses from %s", cache_path)
+            print(f"[{dataset.builder_name}] Loading hypotheses from {cache_path}")
             dataset = datasets.load_from_disk(cache_path)
-        dataset.set_format("pt")
+
+        # 4) Make sure HF dataset returns NumPy arrays (so TF collators can consume)
+        dataset.set_format("numpy")
         return dataset, cache_path
 
     def precompute_hypotheses(self) -> None:
@@ -231,147 +238,90 @@ class Corrector(BaseTrainer):
 
     def generate(
         self,
-        inputs: Dict,
-        generation_kwargs: Dict,
-        num_recursive_steps: int = None,
-        sequence_beam_width: int = None,
-    ) -> torch.Tensor:
-        """Generates text using self-correction.
-
-        Args:
-            inputs (Dict[str, torch.Tensor]): inputs for generation, like the input embedding, hypothesis,
-                and hypothesis embedding
-            generation_kwargs (Dict): dictionary of parameters for generation, will be passed on to the model
-            sequence_beam_width (int): beam width for sequence-level beam search
-        Returns:
-            generated_ids (torch.Tensor): ids of generated text
-        """
-        try:
-            frozen_embeddings = inputs["frozen_embeddings"]
-            hypothesis_input_ids = inputs["hypothesis_input_ids"]
-            hypothesis_attention_mask = inputs["hypothesis_attention_mask"]
-            hypothesis_embedding = inputs["hypothesis_embedding"]
-        except KeyError:
-            (
-                frozen_embeddings,
-                hypothesis_input_ids,
-                hypothesis_attention_mask,
-                hypothesis_embedding,
-            ) = self._get_hypothesis_uncached(inputs=inputs)
-
-        # Add beam dimension:
-        #       (batch, ...) -> (batch, beam, ...)
-        inputs["frozen_embeddings"] = frozen_embeddings
-        inputs["hypothesis_input_ids"] = hypothesis_input_ids
-        inputs["hypothesis_attention_mask"] = hypothesis_attention_mask
-        inputs["hypothesis_embedding"] = hypothesis_embedding
-        # print("generating with sequence_beam_width:", (sequence_beam_width or self.sequence_beam_width))
-
-        num_recursive_steps = num_recursive_steps or self.num_gen_recursive_steps
-        sequence_beam_width = sequence_beam_width or self.sequence_beam_width
-        num_recursive_steps_so_far = 0
-
-        total_best_scores_seen = None  # Track best scores for early stopping
-
-        while num_recursive_steps >= 1:
-            gen_text_ids, hypothesis_embedding, best_scores = self._generate_with_beam(
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any],
+        num_recursive_steps: Optional[int] = None,
+        sequence_beam_width: Optional[int] = None,
+    ) -> tf.Tensor:
+        # Ensure hypothesis inputs present
+        if 'frozen_embeddings' in inputs:
+            fe = inputs['frozen_embeddings']
+            hi = inputs['hypothesis_input_ids']
+            hm = inputs['hypothesis_attention_mask']
+            he = inputs['hypothesis_embedding']
+        else:
+            fe, hi, hm, he = self._get_hypothesis_uncached(inputs)
+        inputs['frozen_embeddings'] = fe
+        inputs['hypothesis_input_ids'] = hi
+        inputs['hypothesis_attention_mask'] = hm
+        inputs['hypothesis_embedding'] = he
+        steps = num_recursive_steps or self.num_gen_recursive_steps
+        beam_w = sequence_beam_width or self.sequence_beam_width
+        steps_done = 0
+        total_best = None
+        while steps > 0:
+            gen_ids, he, best_scores = self._generate_with_beam(
                 inputs=inputs,
                 generation_kwargs=generation_kwargs,
-                num_recursive_steps=num_recursive_steps,
-                num_recursive_steps_so_far=num_recursive_steps_so_far,
-                sequence_beam_width=sequence_beam_width,
+                num_recursive_steps=steps,
+                num_recursive_steps_so_far=steps_done,
+                sequence_beam_width=beam_w,
             )
-            inputs["hypothesis_input_ids"] = gen_text_ids
-            inputs["hypothesis_attention_mask"] = (
-                gen_text_ids != self.model.encoder_decoder.config.pad_token_id
-            ).int()
-            inputs["hypothesis_embedding"] = hypothesis_embedding
-            # step counters
-            num_recursive_steps -= 1
-            num_recursive_steps_so_far += 1
-            # early stopping
-            if best_scores is not None:
-                if (total_best_scores_seen is not None) and torch.isclose(
-                    best_scores, total_best_scores_seen, atol=1e-3
-                ):
+            inputs['hypothesis_input_ids'] = gen_ids
+            inputs['hypothesis_attention_mask'] = tf.cast(
+                tf.not_equal(gen_ids, self.pad_token_id), tf.int32
+            )
+            inputs['hypothesis_embedding'] = he
+            steps -= 1
+            steps_done += 1
+            if best_scores is not None and total_best is not None:
+                if tf.reduce_all(tf.math.is_close(best_scores, total_best, atol=1e-3)):
                     print(
                         "scores stopped increasing! stopping early after",
-                        num_recursive_steps_so_far,
+                        steps_done,
                         "steps",
                     )
                     break
-                best_scores = total_best_scores_seen
+            total_best = best_scores
+        return gen_ids
 
-        return gen_text_ids
 
     def _generate_with_beam(
         self,
-        inputs: Dict,
-        generation_kwargs: Dict,
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any],
         num_recursive_steps: int,
         num_recursive_steps_so_far: int,
         sequence_beam_width: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generates text using self-correction.
-
-        Args:
-            inputs (Dict[str, torch.Tensor]): inputs for generation, like the input embedding, hypothesis,
-                and hypothesis embedding
-            generation_kwargs (Dict): dictionary of parameters for generation, will be passed on to the model
-            num_recursive_steps (int): Number of remaining steps of recursion, used to know when to stop
-            num_recusive_steps_so_far (int): Number of steps of recursion performed so far. This is how we
-                can check if it's the initial hypothesis or not.
-            sequence_beam_width (int): beam width for sequence-level beam search
-        Returns:
-            generated_ids (torch.Tensor): ids of generated text
-        """
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         assert num_recursive_steps >= 1
         frozen_embeddings = inputs["frozen_embeddings"]
-        ################################################################################
-        if not generation_kwargs["do_sample"]:
+
+        # Set up beam size in kwargs
+        if not generation_kwargs.get("do_sample", False):
             num_return_sequences = max(
                 sequence_beam_width, generation_kwargs.get("num_beams", 1)
             )
             generation_kwargs["num_beams"] = num_return_sequences
             generation_kwargs["num_return_sequences"] = num_return_sequences
 
-        if (num_recursive_steps_so_far == 0) and (
-            self.initial_hypothesis_str is not None
-        ):
-            # Support setting a string as the initial hypothesis (for ablations)
+        # Step 0: use initial hypothesis if provided
+        if num_recursive_steps_so_far == 0 and self.initial_hypothesis_str is not None:
             logger.info(f"Using initial hypothesis: {self.initial_hypothesis_str}")
-            # If set, uses this string as the hypothesis for step 0 of self-correction
-            batch_size = frozen_embeddings.shape[0]
-            gen_text_ids = (
-                self.embedder_tokenizer(
-                    [self.initial_hypothesis_str],
-                    return_tensors="pt",
-                    max_length=inputs["hypothesis_input_ids"].shape[1],
-                    truncation=True,
-                    padding="max_length",
-                )["input_ids"]
-                .repeat((batch_size, 1))
-                .to(self.args.device)
-            )
-            # gen_text_ids = (
-            #     torch.randint(
-            #         low=1,
-            #         high=self.embedder_tokenizer.vocab_size,
-            #         size=(1, inputs["hypothesis_input_ids"].shape[1]),
-            #         dtype=torch.long,
-            #     )
-            #     .repeat((batch_size, 1))
-            #     .to(self.args.device)
-            # )
-            bos_token_id = self.model.encoder_decoder.config.decoder_start_token_id
-            bos_token_ids = (
-                torch.ones(
-                    (batch_size, 1), dtype=torch.long, device=gen_text_ids.device
-                )
-                * bos_token_id
-            )
-            gen_text_ids = torch.cat((bos_token_ids, gen_text_ids[:, :-1]), dim=1)
+            batch_size = tf.shape(frozen_embeddings)[0]
+            hyp_ids = self.embedder_tokenizer(
+                [self.initial_hypothesis_str],
+                return_tensors="tf",
+                max_length=inputs["hypothesis_input_ids"].shape[1],
+                truncation=True,
+                padding="max_length",
+            )["input_ids"]
+            gen_text_ids = tf.tile(hyp_ids, [batch_size, 1])
+            bos_id = self.model.encoder_decoder.config.decoder_start_token_id
+            bos_tokens = tf.fill([batch_size, 1], bos_id)
+            gen_text_ids = tf.concat([bos_tokens, gen_text_ids[:, :-1]], axis=1)
         else:
+            # Generate via HF TF generate
             outputs = self.model.generate(
                 inputs=inputs,
                 generation_kwargs=generation_kwargs,
@@ -379,225 +329,140 @@ class Corrector(BaseTrainer):
             )
             gen_text_ids = outputs.sequences
 
-            # get scores for sequences to compute sequence-level likelihood.
-            # https://discuss.huggingface.co/t/announcement-generation-get-probabilities-for-generated-output/30075
-            if "beam_indices" in outputs:
-                with torch.no_grad():
-                    transition_scores = (
-                        self.model.encoder_decoder.compute_transition_scores(
-                            outputs.sequences,
-                            outputs.scores,
-                            outputs.beam_indices,
-                            normalize_logits=True,
-                        )
-                    )
+            # Compute sequence‐level scores
+            if hasattr(outputs, "beam_indices"):
+                transition_scores = self.model.encoder_decoder.compute_transition_scores(
+                    outputs.sequences,
+                    outputs.scores,
+                    outputs.beam_indices,
+                    normalize_logits=True,
+                )
             else:
-                with torch.no_grad():
-                    transition_scores = (
-                        self.model.encoder_decoder.compute_transition_scores(
-                            outputs.sequences, outputs.scores, normalize_logits=True
-                        )
-                    )
-            length_penalty = self.model.encoder_decoder.generation_config.length_penalty
-            output_length = (transition_scores < 0).sum(1)
-            del outputs.scores
-            gen_text_scores = transition_scores.sum(axis=1) / (
-                output_length**length_penalty
-            )  # log probs
+                transition_scores = self.model.encoder_decoder.compute_transition_scores(
+                    outputs.sequences,
+                    outputs.scores,
+                    normalize_logits=True,
+                )
+            lp = self.model.encoder_decoder.generation_config.length_penalty
+            neg_mask = tf.less(transition_scores, 0)
+            output_length = tf.reduce_sum(tf.cast(neg_mask, tf.float32), axis=1)
+            gen_text_scores = (
+                tf.reduce_sum(transition_scores, axis=1) /
+                tf.pow(output_length, lp)
+            )
 
-        # Re-embed generated text so we can rerank, and track the best we've seen so far.
+        # Re‐embed to rerank
         hypothesis_embedding = self.embed_generated_hypothesis(input_ids=gen_text_ids)
 
+        # Determine real batch size
         if num_recursive_steps_so_far == 0:
-            batch_size = frozen_embeddings.shape[0]
+            batch_size = tf.shape(frozen_embeddings)[0]
         else:
-            # after the first step, we've already copied frozen embeddings across the beam
-            batch_size = int(frozen_embeddings.shape[0] / sequence_beam_width)
+            batch_size = tf.shape(frozen_embeddings)[0] // sequence_beam_width
 
         best_scores = None
-        #
-        #   BEAM SEARCH
-        #
-        if gen_text_ids.shape[0] > batch_size:
-            if sequence_beam_width == 1:
-                # This is "regular" beam search.
-                beam_width = int(gen_text_ids.shape[0] / batch_size)
-                distances_per_beam = torch.nn.CosineSimilarity(dim=2)(
-                    hypothesis_embedding.reshape((batch_size, beam_width, -1)),
-                    inputs["frozen_embeddings"][:, None, :],
-                )
-                if self.return_best_hypothesis:
-                    scores = distances_per_beam
-                else:
-                    scores = gen_text_scores.reshape((batch_size, beam_width))
-                best_idx_in_beam = scores.argmax(1)
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size, beam_width, -1)
-                )[torch.arange(batch_size), best_idx_in_beam]
-                gen_text_ids = gen_text_ids.reshape((batch_size, beam_width, -1))[
-                    torch.arange(batch_size), best_idx_in_beam
-                ]
-                # Flatten again so we can do normal operations.
-                gen_text_ids = gen_text_ids.reshape(
-                    (batch_size * sequence_beam_width, -1)
-                )
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size * sequence_beam_width, -1)
-                )
-            elif num_recursive_steps == 1:
-                # Base case for sequence-level beam search.
-                beam_width = int(gen_text_ids.shape[0] / batch_size)
-                frozen_embeddings_per_beam = (
-                    inputs["frozen_embeddings"][:, None, :]
-                    .repeat((1, num_return_sequences, 1))
-                    .reshape((batch_size, beam_width, -1))
-                )
-                distances_per_beam = torch.nn.CosineSimilarity(dim=2)(
-                    hypothesis_embedding.reshape((batch_size, beam_width, -1)),
-                    frozen_embeddings_per_beam,
-                )
-                if self.return_best_hypothesis:
-                    scores = distances_per_beam
-                else:
-                    scores = gen_text_scores.reshape((batch_size, beam_width))
-                best_idx_in_beam = scores.argmax(dim=1)
-                # print("best_idx_in_beam:", best_idx_in_beam)
-                # print("avg_distances:", distances_per_beam.mean(1).tolist(), "max_distances:", distances_per_beam.max(1).values.tolist())
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size, beam_width, -1)
-                )[torch.arange(batch_size), best_idx_in_beam]
-                gen_text_ids = gen_text_ids.reshape((batch_size, beam_width, -1))[
-                    torch.arange(batch_size), best_idx_in_beam
-                ]
+
+        # If beam search expanded the batch
+        total_seqs = tf.shape(gen_text_ids)[0]
+        if total_seqs > batch_size:
+            beam_width = total_seqs // batch_size
+
+            # Reshape to [batch, beam, ...]
+            hyp_emb = tf.reshape(hypothesis_embedding, [batch_size, beam_width, -1])
+            frozen = tf.expand_dims(frozen_embeddings, 1)  # [batch,1,dim]
+            distances = tf.reduce_sum(
+                tf.math.l2_normalize(hyp_emb, axis=2) *
+                tf.math.l2_normalize(frozen, axis=2),
+                axis=2
+            )
+
+            if self.return_best_hypothesis:
+                scores = distances
             else:
-                # Now get top things in the beam like normal.
-                beam_width = int(gen_text_ids.shape[0] / batch_size)
-                assert (
-                    beam_width % sequence_beam_width == 0
-                ), "inner beam width must divide sequence beam width"
+                scores = tf.reshape(gen_text_scores, [batch_size, beam_width])
 
-                if num_recursive_steps_so_far == 0:
-                    # This is the first return for sequence-level beam search.
-                    # First we have to copy the frozen embedding
-                    frozen_embeddings_per_beam = (
-                        inputs["frozen_embeddings"][:, None, :]
-                        .repeat((1, num_return_sequences, 1))
-                        .reshape((batch_size, num_return_sequences, -1))
-                    )
-                    inputs["frozen_embeddings"] = (
-                        inputs["frozen_embeddings"][:, None, :]
-                        .repeat((1, sequence_beam_width, 1))
-                        .reshape((batch_size * sequence_beam_width, -1))
-                    )
-                else:
-                    frozen_embeddings_per_beam = (
-                        inputs["frozen_embeddings"][:, None, :]
-                        .repeat((1, num_return_sequences, 1))
-                        .reshape(
-                            (batch_size, sequence_beam_width * num_return_sequences, -1)
-                        )
-                    )
+            # Pick best index per batch
+            best_idx = tf.argmax(scores, axis=1, output_type=tf.int32)
 
-                distances_per_beam = torch.nn.CosineSimilarity(dim=2)(
-                    hypothesis_embedding.reshape((batch_size, beam_width, -1)),
-                    frozen_embeddings_per_beam,
-                )
+            # Gather best hypotheses
+            row_idx = tf.range(batch_size, dtype=tf.int32)
+            hypothesis_embedding = tf.gather_nd(
+                hyp_emb, tf.stack([row_idx, best_idx], axis=1)
+            )
+            ids_reshaped = tf.reshape(gen_text_ids, [batch_size, beam_width, -1])
+            gen_text_ids = tf.gather_nd(
+                ids_reshaped, tf.stack([row_idx, best_idx], axis=1)
+            )
 
-                if self.return_best_hypothesis:
-                    scores = distances_per_beam
-                else:
-                    scores = gen_text_scores.reshape((batch_size, beam_width))
+            # Flatten back
+            gen_text_ids = tf.reshape(gen_text_ids, [batch_size * sequence_beam_width, -1])
+            hypothesis_embedding = tf.reshape(
+                hypothesis_embedding, [batch_size * sequence_beam_width, -1]
+            )
 
-                # print("scores:")
-                # for t, s in zip(self.tokenizer.batch_decode(gen_text_ids, skip_special_tokens=True), scores.flatten().tolist()):
-                #     print(f"\t- {s:2f}", t)
-                # print()
+            best_scores = tf.reduce_max(scores, axis=1)
 
-                # take top *unique* things in beam.
-                best_idx_in_beam_total = scores.topk(dim=1, k=beam_width).indices
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size, beam_width, -1)
-                )
-                gen_text_ids = gen_text_ids.reshape((batch_size, beam_width, -1))
-                best_idx_in_beam = []
-                for batch_idx in range(len(best_idx_in_beam_total)):
-                    gen_text_set = set()  # track uniqueness
-                    best_idx_in_beam.append([])
-                    for j in best_idx_in_beam_total[batch_idx].tolist():
-                        gen_text_i = tuple(gen_text_ids[batch_idx, j].tolist())
-                        if gen_text_i not in gen_text_set:
-                            gen_text_set.add(gen_text_i)
-                            best_idx_in_beam[batch_idx].append(j)
-                        if len(best_idx_in_beam[batch_idx]) == sequence_beam_width:
-                            break
-                best_idx_in_beam = torch.tensor(
-                    best_idx_in_beam, device=best_idx_in_beam_total.device
-                )
-                # now take top unique things
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size, beam_width, -1)
-                )[torch.arange(batch_size)[:, None], best_idx_in_beam]
-                gen_text_ids = gen_text_ids.reshape((batch_size, beam_width, -1))[
-                    torch.arange(batch_size)[:, None], best_idx_in_beam
-                ]
-
-                # Flatten again so we can do normal operations.
-                gen_text_ids = gen_text_ids.reshape(
-                    (batch_size * sequence_beam_width, -1)
-                )
-                hypothesis_embedding = hypothesis_embedding.reshape(
-                    (batch_size * sequence_beam_width, -1)
-                )
-
-            # print scores for any type of beam search
-            best_scores = scores.max(1).values.cpu()
-        # make sure we reshape correctly
-        # (can't do a shape check on gen_text_ids because of the dynamic length.)
-        assert hypothesis_embedding.shape[-1] == inputs["frozen_embeddings"].shape[-1]
+        # Sanity check dims
+        assert hypothesis_embedding.shape[-1] == frozen_embeddings.shape[-1]
 
         return gen_text_ids, hypothesis_embedding, best_scores
 
+
     def get_frozen_embeddings(
-        self,
-        embedder_input_ids: torch.Tensor,
-        embedder_attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            frozen_embeddings = self.inversion_trainer.call_embedding_model(
-                input_ids=embedder_input_ids,
-                attention_mask=embedder_attention_mask,
-            )
-
-        return frozen_embeddings.to(self.args.device)
-
-    def embed_generated_hypothesis(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embeds a generated hypothesis. Has to remove EOS token and add BOS token
-        at the beginning.
+            self,
+            embedder_input_ids: tf.Tensor,
+            embedder_attention_mask: tf.Tensor,
+        ) -> tf.Tensor:
         """
-        inputs_str = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-        emb_input_ids = self.embedder_tokenizer(
+        Compute and return frozen embeddings from the inversion trainer without tracking gradients.
+        """
+        # Forward through the frozen embedder model
+        frozen_embeddings = self.inversion_trainer.call_embedding_model(
+            input_ids=embedder_input_ids,
+            attention_mask=embedder_attention_mask,
+        )
+        # Detach to avoid gradient computation
+        return tf.stop_gradient(frozen_embeddings)
+
+    def embed_generated_hypothesis(self, input_ids: tf.Tensor) -> tf.Tensor:
+        """
+        Embeds a generated hypothesis by decoding to strings, re-tokenizing with the embedder tokenizer,
+        and retrieving frozen embeddings.
+        """
+        ids_list = input_ids.numpy().tolist()
+        inputs_str = self.tokenizer.batch_decode(ids_list, skip_special_tokens=True)
+        emb_inputs = self.embedder_tokenizer(
             inputs_str,
             max_length=self.model.config.max_seq_length,
             truncation=True,
             padding="max_length",
-            return_tensors="pt",
-        ).to(input_ids.device)
+            return_tensors="tf",
+        )
         return self.get_frozen_embeddings(
-            embedder_input_ids=emb_input_ids.input_ids,
-            embedder_attention_mask=emb_input_ids.attention_mask,
+            embedder_input_ids=emb_inputs["input_ids"],
+            embedder_attention_mask=emb_inputs["attention_mask"],
         )
 
-    def _get_hypothesis_uncached(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+
+    def _get_hypothesis_uncached(
+        self, inputs: Dict[str, tf.Tensor]
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        """
+        Generate hypothesis inputs & embeddings when not cached.
+        Returns:
+            frozen_embeddings: tf.Tensor
+            hypothesis_input_ids: tf.Tensor
+            hypothesis_attention_mask: tf.Tensor (bool)
+            hypothesis_embedding: tf.Tensor
+        """
+        # 1) Obtain or compute frozen embeddings
         if "frozen_embeddings" in inputs:
             frozen_embeddings = inputs["frozen_embeddings"]
         else:
-            assert (
-                "embedder_input_ids" in inputs
-            ), f"cannot generate hypothesis with input keys: {inputs.keys()}"
-            frozen_embeddings = self.embed_generated_hypothesis(
-                input_ids=inputs["input_ids"]
-            )
+            assert "embedder_input_ids" in inputs, f"Cannot generate hypothesis with inputs {list(inputs.keys())}"
+            frozen_embeddings = self.embed_generated_hypothesis(input_ids=inputs["input_ids"])
 
+        # 2) Prepare generation kwargs
         generation_kwargs = {
             "early_stopping": False,
             "num_beams": 1,
@@ -606,18 +471,19 @@ class Corrector(BaseTrainer):
             "max_length": self.model.config.max_seq_length,
         }
 
+        # 3) Generate raw hypothesis token IDs
         hypothesis_input_ids = self.inversion_trainer.model.generate(
-            inputs={
-                "frozen_embeddings": frozen_embeddings,
-            },
+            inputs={"frozen_embeddings": frozen_embeddings},
             generation_kwargs=generation_kwargs,
         )
-        hypothesis_attention_mask = (
-            hypothesis_input_ids != self.model.encoder_decoder.config.pad_token_id
-        )
-        hypothesis_embedding = self.embed_generated_hypothesis(
-            input_ids=hypothesis_input_ids
-        )
+
+        # 4) Build attention mask (True for real tokens, False for padding)
+        pad_id = self.model.encoder_decoder.config.pad_token_id
+        hypothesis_attention_mask = tf.not_equal(hypothesis_input_ids, pad_id)
+
+        # 5) Embed the generated hypothesis
+        hypothesis_embedding = self.embed_generated_hypothesis(input_ids=hypothesis_input_ids)
+
         return (
             frozen_embeddings,
             hypothesis_input_ids,
@@ -625,103 +491,54 @@ class Corrector(BaseTrainer):
             hypothesis_embedding,
         )
 
+
     def compute_loss(
         self,
         model: CorrectorEncoderModel,
-        inputs: Dict[str, torch.Tensor],
+        inputs: Dict[str, tf.Tensor],
         return_outputs: bool = False,
-    ) -> Union[Tuple[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]:
-        batch_size, seq_length = inputs["input_ids"].shape
-
+    ) -> Union[Tuple[tf.Tensor, Dict[str, tf.Tensor]], tf.Tensor]:
+        """
+        Compute loss for the corrector model, generating hypotheses if needed.
+        """
+        # Ensure hypothesis embeddings exist or generate them
         try:
-            frozen_embeddings = inputs["frozen_embeddings"]
-            hypothesis_input_ids = inputs["hypothesis_input_ids"]
-            hypothesis_attention_mask = inputs["hypothesis_attention_mask"]
-            hypothesis_embedding = inputs["hypothesis_embedding"]
+            fe = inputs["frozen_embeddings"]
+            hi = inputs["hypothesis_input_ids"]
+            hm = inputs["hypothesis_attention_mask"]
+            he = inputs["hypothesis_embedding"]
         except KeyError:
-            (
-                frozen_embeddings,
-                hypothesis_input_ids,
-                hypothesis_attention_mask,
-                hypothesis_embedding,
-            ) = self._get_hypothesis_uncached(inputs=inputs)
+            fe, hi, hm, he = self._get_hypothesis_uncached(inputs)
 
         labels = inputs["labels"]
-        outputs = self.model(
-            embedding=frozen_embeddings,
-            hypothesis_embedding=hypothesis_embedding,
-            hypothesis_input_ids=hypothesis_input_ids,
-            hypothesis_attention_mask=hypothesis_attention_mask,
+        outputs = model(
+            embedding=fe,
+            hypothesis_embedding=he,
+            hypothesis_input_ids=hi,
+            hypothesis_attention_mask=hm,
             labels=labels,
         )
-        return outputs.loss
+        loss = outputs.loss
+        if return_outputs:
+            return loss, outputs
+        return loss
 
     def prediction_step(
-        self,
-        model: nn.Module,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
-        prediction_loss_only: bool,
-        ignore_keys: Optional[List[str]] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Perform an evaluation step on `model` using `inputs`. Called during self.evalaute()
-        """
-        inputs = {key: value.to(self.args.device) for key, value in inputs.items()}
-        with torch.no_grad():
+            self,
+            model: transformers.TFModel,
+            inputs: Dict[str, Any],
+            prediction_loss_only: bool,
+            ignore_keys: Optional[List[str]] = None,
+        ) -> Tuple[Optional[tf.Tensor], Optional[tf.Tensor], Optional[tf.Tensor]]:
+            """
+            Perform an evaluation step on `model` using `inputs`. Called during TFTrainer.evaluate().
+            """
+            # In TF everything is eager by default; no .to(device) needed
             loss = self.compute_loss(model=model, inputs=inputs)
+            # We don’t return logits or labels here
+            return loss, None, None
 
-        logits, labels = None, None
-        return loss, logits, labels
 
     def _remap_state_dict(self, state_dict: Dict) -> Dict:
-        """Edit keys posthumously on model load."""
-        # Rename keys for backward compatibility w/ model trained before
-        # we stopped sharing params between the ff layers
-        if {
-            "embedding_transform.3.weight",
-            "embedding_transform.3.bias",
-        } <= state_dict.keys():
-            print(
-                "Renaming keys",
-                {"embedding_transform.2.weight", "embedding_transform.2.bias"},
-                "for backward compatibility.",
-            )
-            state_dict["embedding_transform_1.0.weight"] = state_dict.pop(
-                "embedding_transform.0.weight"
-            )
-            state_dict["embedding_transform_1.0.bias"] = state_dict.pop(
-                "embedding_transform.0.bias"
-            )
-            state_dict["embedding_transform_1.3.weight"] = state_dict.pop(
-                "embedding_transform.3.weight"
-            )
-            state_dict["embedding_transform_1.3.bias"] = state_dict.pop(
-                "embedding_transform.3.bias"
-            )
-            #
-            state_dict["embedding_transform_2.0.weight"] = state_dict[
-                "embedding_transform_1.0.weight"
-            ]
-            state_dict["embedding_transform_2.0.bias"] = state_dict[
-                "embedding_transform_1.0.bias"
-            ]
-            state_dict["embedding_transform_2.3.weight"] = state_dict[
-                "embedding_transform_1.3.weight"
-            ]
-            state_dict["embedding_transform_2.3.bias"] = state_dict[
-                "embedding_transform_1.3.bias"
-            ]
-            #
-            state_dict["embedding_transform_3.0.weight"] = state_dict[
-                "embedding_transform_1.0.weight"
-            ]
-            state_dict["embedding_transform_3.0.bias"] = state_dict[
-                "embedding_transform_1.0.bias"
-            ]
-            state_dict["embedding_transform_3.3.weight"] = state_dict[
-                "embedding_transform_1.3.weight"
-            ]
-            state_dict["embedding_transform_3.3.bias"] = state_dict[
-                "embedding_transform_1.3.bias"
-            ]
-        return state_dict
+        # TF checkpoint loading doesn’t need PyTorch-style key renames
+            return state_dict

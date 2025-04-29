@@ -1,94 +1,90 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
+import tensorflow as tf
 
-import torch
+from .inversion_tf import InversionTrainer
 
-from vec2text.trainers.inversion import InversionTrainer
+
+def kl_divergence(p: tf.Tensor, q: tf.Tensor, eps: float = 1e-8) -> tf.Tensor:
+    """
+    Compute KL divergence KL(p || q) = sum p * (log p - log q) over last axis.
+    """
+    p_clamped = p + eps
+    q_clamped = q + eps
+    return tf.reduce_sum(p_clamped * (tf.math.log(p_clamped) - tf.math.log(q_clamped)), axis=1)
 
 
 class InversionFromLogitsTrainer(InversionTrainer):
-    """Custom trainer for inverting from logits. Contains special
-    decoding methods that we can only use here, mostly that
-    have to do with conditioning on a suffix.
-    """
+    """Custom trainer for inverting from logits with optional length-check decoding."""
 
     generation_method: Optional[str] = None
 
-    def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
-        # print("generate with method:", self.generation_method)
+    def generate(
+        self,
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any]
+    ) -> tf.Tensor:
         if self.generation_method == "length_check":
-            return self.generate_and_check_length(
-                inputs=inputs, generation_kwargs=generation_kwargs
-            )
-        else:
-            return self.model.generate(
-                inputs=inputs, generation_kwargs=generation_kwargs
-            )
+            return self.generate_and_check_length(inputs, generation_kwargs)
+        return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
     def generate_and_check_length(
-        self, inputs: Dict, generation_kwargs: Dict
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            frozen_embeddings = self.model.call_embedding_model(
-                input_ids=inputs["embedder_input_ids"],
-                attention_mask=inputs["embedder_attention_mask"],
-            )
+        self,
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any]
+    ) -> tf.Tensor:
+        # 1) compute frozen embeddings without gradient
+        frozen_embeddings = tf.stop_gradient(self.model.call_embedding_model(
+            input_ids=inputs["embedder_input_ids"],
+            attention_mask=inputs["embedder_attention_mask"],
+        ))
 
-        batch_size = len(inputs["embedder_input_ids"])
+        batch_size = tf.shape(inputs["embedder_input_ids"])[0]
+        max_len = 64
 
         closest_generations = None
-        closest_generation_distances = None
-        for length in range(1, 64):
+        closest_distances = None
+
+        # 2) iterate over lengths
+        for length in range(1, max_len):
             generation_kwargs["min_length"] = length
             generation_kwargs["max_length"] = length
 
-            generations = self.model.generate(
-                inputs=inputs, generation_kwargs=generation_kwargs
-            )
-            generations_str = self.tokenizer.batch_decode(
-                generations, skip_special_tokens=True
-            )
-            generation_emb_tokenized = self.embedder_tokenizer(
-                generations_str,
-                return_tensors="pt",
-                truncation=True,
-                padding=True,
-                max_length=64,
-            ).to(self.args.device)
-            with torch.no_grad():
-                new_embeddings = self.model.call_embedding_model(
-                    **generation_emb_tokenized
-                )
-            new_distances = torch.nn.functional.kl_div(
-                frozen_embeddings,
-                new_embeddings,
-                reduction="none",
-                log_target=True,
-            ).sum(dim=1)
-            # new_distances = ((frozen_embeddings - new_embeddings) ** 2).sum(1)
+            # generate sequences of this exact length
+            generations = self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
-            num_pad_tokens = 64 - generations.shape[1]
-            pad_tokens = (
-                torch.ones(
-                    (batch_size, num_pad_tokens),
-                    dtype=torch.long,
-                    device=self.args.device,
-                )
-                * self.tokenizer.pad_token_id
+            # decode to text, then re-tokenize for embedder
+            gen_strs = self.tokenizer.batch_decode(generations.numpy().tolist(), skip_special_tokens=True)
+            emb_inputs = self.embedder_tokenizer(
+                gen_strs,
+                return_tensors="tf",
+                truncation=True,
+                padding="max_length",
+                max_length=max_len,
             )
-            generations = torch.cat((generations, pad_tokens), dim=1)
+
+            new_embeddings = tf.stop_gradient(self.model.call_embedding_model(
+                input_ids=emb_inputs["input_ids"],
+                attention_mask=emb_inputs["attention_mask"],
+            ))
+
+            # 3) compute KL divergence
+            new_dist = kl_divergence(frozen_embeddings, new_embeddings)
+
+            # 4) pad to max_len if shorter
+            seq_len = tf.shape(generations)[1]
+            pad_len = max_len - seq_len
+            if pad_len > 0:
+                pad_tokens = tf.fill([batch_size, pad_len], self.tokenizer.pad_token_id)
+                generations = tf.concat([generations, pad_tokens], axis=1)
+
+            # 5) update closest
             if closest_generations is None:
                 closest_generations = generations
-                closest_generation_distances = new_distances
+                closest_distances = new_dist
             else:
-                closest_generations = torch.where(
-                    (new_distances < closest_generation_distances)[:, None],
-                    generations,
-                    closest_generations,
-                )
-                closest_generation_distances = torch.where(
-                    new_distances < closest_generation_distances,
-                    new_distances,
-                    closest_generation_distances,
-                )
+                mask = new_dist < closest_distances
+                mask_exp = tf.expand_dims(mask, 1)
+                closest_generations = tf.where(mask_exp, generations, closest_generations)
+                closest_distances = tf.where(mask, new_dist, closest_distances)
 
         return closest_generations

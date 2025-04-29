@@ -11,9 +11,18 @@ import evaluate
 import nltk
 import numpy as np
 import scipy.stats
-import torch
+#import torch
+import tensorflow as tf
 import tqdm
-import transformers
+#import transformers
+
+from transformers import (
+    TFAutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    TFTrainer,
+    TFTrainingArguments
+)
+
 
 import vec2text
 
@@ -55,7 +64,7 @@ def count_overlapping_ngrams(s1: str, s2: str, n: int) -> int:
     return total
 
 
-class BaseTrainer(transformers.Trainer):
+class BaseTrainer(TFTrainer):
     additional_metrics: List[Callable[..., Dict[str, float]]]
 
     def __init__(self, *args, **kwargs):
@@ -168,60 +177,81 @@ Here are instructions from the user outlining your goals and how you should resp
         return request_args
 
     def evaluate_system_prompts(
-        self, decoded_preds: List[str], decoded_labels: List[str], all_inputs: List[str]
-    ):
-        print(len(decoded_preds))
-        print(len(decoded_labels))
-        print(len(all_inputs["names"]))
-        assert(len(decoded_preds) == len(decoded_labels) and len(decoded_preds) == len(all_inputs['names']))
+        self,
+        decoded_preds: List[str],
+        decoded_labels: List[str],
+        all_inputs: Dict[str, List]
+    ) -> Dict[str, float]:
+        print(len(decoded_preds), len(decoded_labels), len(all_inputs["names"]))
+        assert (
+            len(decoded_preds) == len(decoded_labels)
+            and len(decoded_preds) == len(all_inputs["names"])
+        )
         batch_size = len(decoded_preds)
-        # first get all answers, then get all embeddings
+
         requests = []
         for prompt_idx in range(batch_size):
-            # print(all_inputs)
-            name = all_inputs['names'][prompt_idx]
+            name = all_inputs["names"][prompt_idx]
             pred_prompt = decoded_preds[prompt_idx]
             label_prompt = decoded_labels[prompt_idx]
-            total_answer_score = 0
-            for question_idx, question in enumerate(all_inputs['questions'][prompt_idx]):
-                pred_req_args = self.get_ask_request_args(name, pred_prompt, question)
-                label_req_args = self.get_ask_request_args(name, label_prompt, question)
-                assistant_req_args = self.get_ask_request_args(name, "You are a helpful assistant", question)
-                requests.append((pred_req_args, [0, prompt_idx, question_idx]))
-                requests.append((label_req_args, [1, prompt_idx, question_idx]))
-                requests.append((assistant_req_args, [2, prompt_idx, question_idx]))
-                requests.append((label_req_args, [3, prompt_idx, question_idx]))
-        # TODO: fix this
-        chat_req_res = process_chat_requests(requests)
-        # p[1] is result, p[0] is request, p[0][1] is idx, sort by idx to split pred and labels
-        idx_answers = [(p[0][1], p[1].choices[0].message.content) for p in chat_req_res]
+            for question_idx, question in enumerate(all_inputs["questions"][prompt_idx]):
+                pred_req = self.get_ask_request_args(name, pred_prompt, question)
+                label_req = self.get_ask_request_args(name, label_prompt, question)
+                assistant_req = self.get_ask_request_args(name, "You are a helpful assistant", question)
+
+                requests.append((pred_req, [0, prompt_idx, question_idx]))
+                requests.append((label_req, [1, prompt_idx, question_idx]))
+                requests.append((assistant_req, [2, prompt_idx, question_idx]))
+                requests.append((label_req, [3, prompt_idx, question_idx]))
+
+        # 2) fire them off, get all the answers
+        chat_responses = process_chat_requests(requests)
+        # unpack into correct order
+        idx_answers = [(r[0][1], r[1].choices[0].message.content) for r in chat_responses]
         idx_answers.sort()
-        answers = [p[1] for p in idx_answers]
+        answers = [ans for (_, ans) in idx_answers]
+
+        # 3) embed every answer + every prompt
         embeddings = get_embeddings_openai_vanilla(answers + decoded_preds + decoded_labels)
-        answers_emb = embeddings[:len(answers)]
-        one_fourth = len(answers_emb) // 4
-        preds_answer_emb = torch.tensor(answers_emb[:one_fourth])
-        labels_answer_emb = torch.tensor(answers_emb[one_fourth:one_fourth * 2])
-        assistant_answer_emb = torch.tensor(answers_emb[one_fourth * 2:one_fourth * 3])
-        labels_repeat_answer_emb = torch.tensor(answers_emb[one_fourth * 3:])
-        preds_emb = torch.tensor(embeddings[len(answers):len(answers)+len(decoded_preds)])
-        labels_emb = torch.tensor(embeddings[len(answers)+len(decoded_preds):])
-        promtp_emb_cos_sims = torch.nn.CosineSimilarity(dim=1)(preds_emb, labels_emb)
-        answer_emb_cos_sims = torch.nn.CosineSimilarity(dim=1)(preds_answer_emb, labels_answer_emb)
-        answer_baseline_emb_cos_sims = torch.nn.CosineSimilarity(dim=1)(assistant_answer_emb, labels_answer_emb)
-        self_ans_emb_cos_sims = torch.nn.CosineSimilarity(dim=1)(labels_repeat_answer_emb, labels_answer_emb)
+
+        # 4) slice out the four groups of answers
+        num_answers = len(answers)
+        one_fourth = num_answers // 4
+
+        answers_emb_tensor = tf.convert_to_tensor(embeddings[:num_answers], dtype=tf.float32)
+        preds_answer_emb      = answers_emb_tensor[0:one_fourth]
+        labels_answer_emb     = answers_emb_tensor[one_fourth : one_fourth * 2]
+        assistant_answer_emb  = answers_emb_tensor[one_fourth * 2 : one_fourth * 3]
+        labels_repeat_answer  = answers_emb_tensor[one_fourth * 3 :]
+
+        rest_emb = tf.convert_to_tensor(embeddings[num_answers:], dtype=tf.float32)
+        preds_emb  = rest_emb[0 : len(decoded_preds)]
+        labels_emb = rest_emb[len(decoded_preds) :]
+
+        def cosine_sim(a: tf.Tensor, b: tf.Tensor) -> tf.Tensor:
+            a_norm = tf.math.l2_normalize(a, axis=1)
+            b_norm = tf.math.l2_normalize(b, axis=1)
+            return tf.reduce_sum(a_norm * b_norm, axis=1)
+
+        prompt_cos   = cosine_sim(preds_emb,        labels_emb)
+        answer_cos   = cosine_sim(preds_answer_emb, labels_answer_emb)
+        baseline_cos = cosine_sim(assistant_answer_emb, labels_answer_emb)
+        self_cos     = cosine_sim(labels_repeat_answer, labels_answer_emb)
+
         sim_result = {
-            "prompt_emb_cos_sim": promtp_emb_cos_sims.mean().item(),
-            "prompt_emb_cos_sim_sem": sem(promtp_emb_cos_sims.cpu().numpy()),
-            "answer_emb_cos_sim": answer_emb_cos_sims.mean().item(),
-            "answer_emb_cos_sim_sem": sem(answer_emb_cos_sims.cpu().numpy()),
-            "answer_baseline_emb_cos_sim": answer_baseline_emb_cos_sims.mean().item(),
-            "answer_baseline_emb_cos_sim_sem": sem(answer_baseline_emb_cos_sims.cpu().numpy()),
-            "self_ans_emb_cos_sim": self_ans_emb_cos_sims.mean().item(),
-            "self_ans_emb_cos_sim_sem": sem(self_ans_emb_cos_sims.cpu().numpy())
+            "prompt_emb_cos_sim":           float(tf.reduce_mean(prompt_cos).numpy()),
+            "prompt_emb_cos_sim_sem":       sem(prompt_cos.numpy()),
+            "answer_emb_cos_sim":           float(tf.reduce_mean(answer_cos).numpy()),
+            "answer_emb_cos_sim_sem":       sem(answer_cos.numpy()),
+            "answer_baseline_emb_cos_sim":  float(tf.reduce_mean(baseline_cos).numpy()),
+            "answer_baseline_emb_cos_sim_sem": sem(baseline_cos.numpy()),
+            "self_ans_emb_cos_sim":         float(tf.reduce_mean(self_cos).numpy()),
+            "self_ans_emb_cos_sim_sem":     sem(self_cos.numpy()),
         }
+
         print(sim_result)
         return sim_result
+
 
     def evaluate_kl_divergence(
         self, decoded_preds: List[str], decoded_labels: List[str], all_inputs: List[str]
@@ -264,100 +294,90 @@ Here are instructions from the user outlining your goals and how you should resp
 
 
     def _get_decoded_sequences(
-        self, dataloader: torch.utils.data.DataLoader, n: int
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Iterates through eval dataset and does decoding.
+        self,
+        dataloader: tf.data.Dataset,
+        n: int
+    ) -> Tuple[List[List[int]], List[List[int]], Dict[str, List]]:
+        """Iterates through eval dataset and does decoding using TensorFlow tensors."""
 
-        TODO: do this better. We shouldn't need to iterate through eval set twice
-        but I don't want to copy 1000 lines of code to change their eval loop...
-
-        Probably want custom eval eventually. Also this depends on eval data being
-        in the same order which is annoying.
-        """
         assert not self.model.training
 
         gen_kwargs = copy.copy(self.gen_kwargs)
 
-        all_preds = []
-        all_labels = []
-        all_inputs = {}
-        for step, inputs in enumerate(
-            tqdm.tqdm(dataloader, desc="generating from val", leave=False)
-        ):
-            # https://huggingface.co/docs/transformers/v4.26.1/en/main_classes/text_generation#transformers.GenerationMixin.generate
-            inputs_cuda = {}
+        all_preds: List[List[int]] = []
+        all_labels: List[List[int]] = []
+        all_inputs: Dict[str, List] = {}
+
+        for inputs in dataloader:
+            # inputs is a dict of tf.Tensor batches
+            # 1) collect raw inputs for downstream metrics/logging
             for k, v in inputs.items():
-                all_inputs.setdefault(k, []).extend(v)
-                try:
-                    inputs_cuda[k] = v.to(self.args.device)
-                except:
-                    print(k, "failed, but that's ok")
+                # v is a tf.Tensor of shape (batch_size, seq_len) or similar
+                flat = v.numpy().tolist()
+                all_inputs.setdefault(k, []).extend(flat)
+
+            # 2) set up generation kwargs
             max_length = self.model.config.max_seq_length
             gen_kwargs["max_length"] = max_length
-            with torch.no_grad():
-                generated_text = self.generate(
-                    inputs=inputs_cuda, generation_kwargs=gen_kwargs
-                )
-            if generated_text.shape[1] < max_length:
-                # Pad generated text to max length
-                pad_tokens = (
-                    torch.ones(
-                        (generated_text.shape[0], max_length - generated_text.shape[1]),
-                        dtype=torch.long,
-                        device=generated_text.device,
-                    )
-                    * self.pad_token_id
-                )
-                generated_text = torch.cat((generated_text, pad_tokens), dim=1)
 
-            true_input_ids = inputs["labels"]
-            if true_input_ids.shape[1] < max_length:
-                # Pad true text to max length
-                # Pad generated text to max length
-                pad_tokens = (
-                    torch.ones(
-                        (true_input_ids.shape[0], max_length - true_input_ids.shape[1]),
-                        dtype=torch.long,
-                        device=true_input_ids.device,
-                    )
-                    * self.pad_token_id
-                )
-                true_input_ids = torch.cat((true_input_ids, pad_tokens), dim=1)
+            # 3) generate sequences (TFTrainer’s generate returns a tf.Tensor)
+            generated = self.generate(
+                inputs=inputs,
+                generation_kwargs=gen_kwargs
+            )  # shape: (batch_size, gen_len)
 
-            true_input_ids_cpu_list = true_input_ids.cpu().tolist()
-            for i in range(len(true_input_ids_cpu_list)):
-                for j in range(len(true_input_ids_cpu_list[i])):
-                    if true_input_ids_cpu_list[i][j] == -100:
-                        true_input_ids_cpu_list[i][j] = 0
-            all_preds.extend(generated_text.cpu().tolist())
-            all_labels.extend(true_input_ids_cpu_list)
+            # 4) pad generated to max_length if needed
+            gen_shape = tf.shape(generated)
+            batch_size, gen_len = gen_shape[0], gen_shape[1]
+            pad_len = max_length - gen_len
+            if pad_len > 0:
+                pad_tokens = tf.fill([batch_size, pad_len], self.pad_token_id)
+                generated = tf.concat([generated, pad_tokens], axis=1)
+
+            # 5) get true labels and pad similarly
+            true_ids = inputs["labels"]  # shape: (batch_size, label_len)
+            label_len = tf.shape(true_ids)[1]
+            pad_len_lbl = max_length - label_len
+            if pad_len_lbl > 0:
+                pad_lbl = tf.fill([tf.shape(true_ids)[0], pad_len_lbl], self.pad_token_id)
+                true_ids = tf.concat([true_ids, pad_lbl], axis=1)
+
+            # 6) replace -100 with pad_token_id in numpy
+            true_np = true_ids.numpy()
+            true_np[true_np == -100] = 0
+
+            # 7) append to our lists
+            all_preds.extend(generated.numpy().tolist())
+            all_labels.extend(true_np.tolist())
+
+            # 8) stop once we have enough
             if len(all_preds) >= n:
                 break
 
         return all_preds, all_labels, all_inputs
 
-    def _compute_data_metrics(
-        self, inputs: Dict[str, torch.Tensor]
-    ) -> Dict[str, float]:
-        inputs_pad_tokens = (
-            (inputs["input_ids"] == self.tokenizer.pad_token_id)
-            .sum(dim=1)
-            .float()
-            .mean()
-            .item()
-        )
-        embedder_inputs_pad_tokens = (
-            (inputs["embedder_input_ids"] == self.embedder_tokenizer.pad_token_id)
-            .sum(dim=1)
-            .float()
-            .mean()
-            .item()
+
+    def _compute_data_metrics(self, inputs: Dict[str, tf.Tensor]) -> Dict[str, float]:
+        # compute average number of pad tokens per example for encoder inputs
+        input_ids = inputs["input_ids"]
+        pad_id = self.tokenizer.pad_token_id
+        pad_mask = tf.cast(tf.equal(input_ids, pad_id), tf.float32)
+        inputs_pad_tokens = float(
+            tf.reduce_mean(tf.reduce_sum(pad_mask, axis=1)).numpy()
         )
 
-        inputs_non_pad_tokens = inputs["input_ids"].shape[1] - inputs_pad_tokens
-        embedder_inputs_non_pad_tokens = (
-            inputs["input_ids"].shape[1] - embedder_inputs_pad_tokens
+        # compute average number of pad tokens per example for embedder inputs
+        embed_ids = inputs["embedder_input_ids"]
+        embed_pad_id = self.embedder_tokenizer.pad_token_id
+        embed_pad_mask = tf.cast(tf.equal(embed_ids, embed_pad_id), tf.float32)
+        embedder_inputs_pad_tokens = float(
+            tf.reduce_mean(tf.reduce_sum(embed_pad_mask, axis=1)).numpy()
         )
+
+        # sequence length (assumed same for both)
+        seq_len = input_ids.shape[1]
+        inputs_non_pad_tokens = seq_len - inputs_pad_tokens
+        embedder_inputs_non_pad_tokens = seq_len - embedder_inputs_pad_tokens
 
         return {
             "encoder_decoder_inputs_pad_tokens": inputs_pad_tokens,
@@ -370,20 +390,29 @@ Here are instructions from the user outlining your goals and how you should resp
         preds = eval_preds.predictions
         labels = eval_preds.label_ids
 
-        assert len(labels), "got empty labels for eval"
-        assert (
-            torch.tensor(preds).shape == torch.tensor(labels).shape
-        ), f"preds.shape {preds.shape} / labels.shape {labels.shape}"
+        # ensure we have labels
+        assert labels is not None and labels.size > 0, "got empty labels for eval"
 
-        # preds have the same shape as the labels.
-        labels = labels.reshape(-1)
-        preds = preds.reshape(-1)
-        accuracy_result = self.metric_accuracy.compute(
-            predictions=preds, references=labels
+        # convert to TF tensors & check shapes
+        preds_tf = tf.convert_to_tensor(preds)
+        labels_tf = tf.convert_to_tensor(labels)
+        assert preds_tf.shape == labels_tf.shape, (
+            f"preds.shape {preds_tf.shape} / labels.shape {labels_tf.shape}"
         )
 
+        # flatten and move back to Python lists for HF metrics
+        preds_flat = tf.reshape(preds_tf, [-1])
+        labels_flat = tf.reshape(labels_tf, [-1])
+        preds_list = preds_flat.numpy().tolist()
+        labels_list = labels_flat.numpy().tolist()
+
+        accuracy_result = self.metric_accuracy.compute(
+            predictions=preds_list, references=labels_list
+        )
         return {**accuracy_result}
 
+    
+    
     def _text_comparison_metrics(
         self,
         predictions_ids: List[List[int]],
@@ -489,179 +518,118 @@ Here are instructions from the user outlining your goals and how you should resp
 
         return all_metrics
 
+
     def eval_generation_metrics(
-        self, dataloader: torch.utils.data.DataLoader
+        self,
+        dataloader: tf.data.Dataset
     ) -> Dict[str, float]:
-        # Get decoded text. Note that this is different than `preds`, which
-        # is used to compute the loss.
+        # 1) decode sequences via your TF _get_decoded_sequences
         preds_sample_list, preds_sample_labels_list, all_inputs = self._get_decoded_sequences(
             dataloader=dataloader, n=10000
         )
 
-        # Log BLEU, log table of text.
+        # 2) decode text for BLEU/logging
         decoded_preds = self.tokenizer.batch_decode(
             preds_sample_list, skip_special_tokens=True
         )
         decoded_labels = self.tokenizer.batch_decode(
             preds_sample_labels_list, skip_special_tokens=True
         )
+
+        # grab first 3 inputs for printing
         decoded_all_inputs = []
-        for inputs in all_inputs['input_ids'][:3]:
-            decoded_all_inputs.append(self.tokenizer.batch_decode(
-                inputs, skip_special_tokens=True
-            ))
+        for seq in all_inputs['input_ids'][:3]:
+            decoded_all_inputs.append(
+                self.tokenizer.batch_decode(seq, skip_special_tokens=True)
+            )
+
+        # compute BLEU/F1/etc
         bleu_result = self._text_comparison_metrics(
             predictions_ids=preds_sample_list,
             predictions_str=decoded_preds,
             references_ids=preds_sample_labels_list,
             references_str=decoded_labels,
         )
-        # TODO: also log inputs here
+
+        # log table to wandb if enabled
         self._log_preds_table(
             table_key="val_text_preds",
             decoded_preds=decoded_preds,
             decoded_labels=decoded_labels,
         )
 
-        if not len(decoded_preds):
+        if not decoded_preds:
             return {}
-        print("[input]")
-        for decoded_inputs in decoded_all_inputs[0]:
-            print(decoded_inputs)
-        print("[pred]", decoded_preds[0])
-        print("[true]", decoded_labels[0])
-        print("\n\n")
-        print("[input]")
-        for decoded_inputs in decoded_all_inputs[1]:
-            print(decoded_inputs)
-        print("[pred]", decoded_preds[1])
-        print("[true]", decoded_labels[1])
-        print("\n\n")
-        print("[input]")
-        for decoded_inputs in decoded_all_inputs[2]:
-            print(decoded_inputs)
-        print("[pred]", decoded_preds[2])
-        print("[true]", decoded_labels[2])
 
-        # Compute sims of eval data using embedder.
-        preds_sample = torch.tensor(preds_sample_list, device=self.args.device)[:128]
-        preds_sample_labels = torch.tensor(
-            preds_sample_labels_list, device=self.args.device
-        )[:128]
+        # print the first 3 examples exactly as before
+        for i in range(3):
+            print("[input]")
+            for inp in decoded_all_inputs[i]:
+                print(inp)
+            print(f"[pred] {decoded_preds[i]}")
+            print(f"[true] {decoded_labels[i]}\n\n")
 
-        # Log num tokens.
+        # 3) convert first 128 back to tensors for token counts
+        preds_tf  = tf.convert_to_tensor(preds_sample_list,       dtype=tf.int32)[:128]
+        labels_tf = tf.convert_to_tensor(preds_sample_labels_list, dtype=tf.int32)[:128]
+
+        # 4) mask out pad & bos, then count per-row and average
+        mask_pred = tf.logical_and(
+            tf.not_equal(preds_tf, self.pad_token_id),
+            tf.not_equal(preds_tf, self.bos_token_id)
+        )
+        pred_counts = tf.reduce_sum(tf.cast(mask_pred, tf.float32), axis=1)
+        pred_num_tokens = float(tf.reduce_mean(pred_counts).numpy())
+
+        mask_true = tf.logical_and(
+            tf.not_equal(labels_tf, self.pad_token_id),
+            tf.not_equal(labels_tf, self.bos_token_id)
+        )
+        true_counts = tf.reduce_sum(tf.cast(mask_true, tf.float32), axis=1)
+        true_num_tokens = float(tf.reduce_mean(true_counts).numpy())
+
         num_tokens_metrics = {
-            "pred_num_tokens": (
-                (preds_sample != self.pad_token_id)
-                & (preds_sample != self.bos_token_id)
-            )
-            .sum(1)
-            .float()
-            .mean()
-            .item(),
-            "true_num_tokens": (
-                (preds_sample_labels != self.pad_token_id)
-                & (preds_sample_labels != self.bos_token_id)
-            )
-            .sum(1)
-            .float()
-            .mean()
-            .item(),
+            "pred_num_tokens": pred_num_tokens,
+            "true_num_tokens": true_num_tokens,
         }
 
-        # Fix eos token on generated text.
-        # bos_token_id = self.embedder_tokenizer.pad_token_id
-        # assert (preds_sample[:, 0] == bos_token_id).all()
+        # 5) fix EOS token if needed
         eos_token_id = self.embedder_tokenizer.eos_token_id
         if eos_token_id is not None:
-            eos_tokens = (
-                torch.ones(
-                    (len(preds_sample), 1),
-                    dtype=torch.long,
-                    device=self.args.device,
-                )
-                * eos_token_id
-            )
-            preds_sample = torch.cat((preds_sample[:, 1:], eos_tokens), dim=1)
-            # assert preds_sample.shape == preds_sample_labels.shape
+            batch = tf.shape(preds_tf)[0]
+            eos_tokens = tf.fill([batch, 1], eos_token_id)
+            preds_tf = tf.concat([preds_tf[:, 1:], eos_tokens], axis=1)
 
-        # try:
-        #     with torch.no_grad():
-        #         # self.inversion_trainer.model.noise_level = 0.0
-        #         preds_sample_retokenized = self.embedder_tokenizer(
-        #             decoded_preds,
-        #             padding=True,
-        #             truncation=False,
-        #             return_tensors="pt",
-        #         )["input_ids"].to(preds_sample.device)
-        #         preds_sample_retokenized = preds_sample_retokenized[
-        #             : self.args.per_device_eval_batch_size, :
-        #         ]
-        #         pad_token_id = self.pad_token_id
-        #         preds_emb = self.call_embedding_model(
-        #             input_ids=preds_sample_retokenized,
-        #             attention_mask=(preds_sample_retokenized != pad_token_id).to(
-        #                 self.args.device
-        #             ),
-        #         )
-        #         preds_sample_labels_retokenized = self.embedder_tokenizer(
-        #             decoded_labels, padding=True, truncation=False, return_tensors="pt"
-        #         )["input_ids"].to(preds_sample.device)
-        #         preds_sample_labels_retokenized = preds_sample_labels_retokenized[
-        #             : self.args.per_device_eval_batch_size, :
-        #         ]
-        #         labels_emb = self.call_embedding_model(
-        #             input_ids=preds_sample_labels_retokenized,
-        #             attention_mask=(preds_sample_labels_retokenized != pad_token_id).to(
-        #                 self.args.device
-        #             ),
-        #         )
-        #         emb_cos_sims = torch.nn.CosineSimilarity(dim=1)(preds_emb, labels_emb)
-        #         emb_topk_equal = (
-        #             (preds_emb[:, :32000].argmax(1) == labels_emb[:, :32000].argmax(1))
-        #             .float()
-        #             .cpu()
-        #         )
-        #         sim_result = {
-        #             "emb_cos_sim": emb_cos_sims.mean().item(),
-        #             "emb_cos_sim_sem": sem(emb_cos_sims.cpu().numpy()),
-        #             "emb_top1_equal": emb_topk_equal.mean().item(),
-        #             "emb_top1_equal_sem": sem(emb_topk_equal),
-        #         }
-
-        # except (TypeError, RuntimeError,):
         sim_result = {}
-        # sim_result = self.evaluate_system_prompts(decoded_preds, decoded_labels, all_inputs)
-        # sim_result = self.evaluate_kl_divergence(decoded_preds, decoded_labels, all_inputs)
 
-        # Store stuff for access later.
-        # self.preds_emb = preds_emb.cpu()
-        # self.labels_emb = labels_emb.cpu()
-        self.preds_sample_list = preds_sample_list
+        # 6) store for later inspection
+        self.preds_sample_list        = preds_sample_list
         self.preds_sample_labels_list = preds_sample_labels_list
 
-        metrics = {**num_tokens_metrics, **bleu_result, **sim_result}
+        # 7) merge all metrics
+        return {**num_tokens_metrics, **bleu_result, **sim_result}
+
+
+    def evaluate(
+        self,
+        eval_dataset: tf.data.Dataset = None,
+        **kwargs
+    ) -> Dict[str, float]:
+        """
+        Run evaluation and return metrics, then add generation-based metrics.
+        """
+        # 1) run the standard TFTrainer evaluation
+        metrics = super().evaluate(eval_dataset=eval_dataset, **kwargs)
+
+        # 2) on the main process, compute your text-generation metrics
+        if self.args.local_rank <= 0:
+            gen_metrics = self.eval_generation_metrics(dataloader=eval_dataset)
+            # if you want a prefix, you can do:
+            # gen_metrics = {f"eval_{k}": v for k, v in gen_metrics.items()}
+            metrics.update(gen_metrics)
+
         return metrics
 
-    def evaluation_loop(
-        self, dataloader: torch.utils.data.DataLoader, *args, **kwargs
-    ) -> transformers.trainer_utils.EvalLoopOutput:
-        """
-        Run evaluation and returns metrics.
-
-        Override to compute ppl from eval loss.
-        """
-        output = super().evaluation_loop(dataloader=dataloader, *args, **kwargs)
-        metric_key_prefix = kwargs["metric_key_prefix"]
-        # TODO compute some data metrics here too.
-        if self.args.local_rank <= 0:
-            # Generate some text on worker 0 and compute metrics.
-            generation_metrics = self.eval_generation_metrics(dataloader=dataloader)
-            generation_metrics = {
-                f"{metric_key_prefix}_{k}": v for k, v in generation_metrics.items()
-            }
-            output.metrics.update(generation_metrics)
-        return output
 
     def _remap_state_dict(self, state_dict: Dict) -> Dict:
         """Edit keys posthumously on model load."""
@@ -673,34 +641,23 @@ Here are instructions from the user outlining your goals and how you should resp
         """
         super()._load_from_checkpoint(resume_from_checkpoint, model=model)
         return
-        # WEIGHTS_NAME = "pytorch_model.bin"
-        WEIGHTS_NAME = "model.safetensors"
 
+        # If you’ve saved a TF checkpoint under this directory, we can restore it:
         if model is None:
             model = self.model
 
-        if not os.path.isfile(os.path.join(resume_from_checkpoint, WEIGHTS_NAME)):
-            raise ValueError(
-                f"Can't find a valid checkpoint at {resume_from_checkpoint}"
-            )
+        ckpt_dir = resume_from_checkpoint
+        if not tf.io.gfile.exists(ckpt_dir):
+            raise ValueError(f"Can't find a valid checkpoint directory at {ckpt_dir}")
 
-        logger.info(f"Loading model from {resume_from_checkpoint}.")
+        logger.info(f"Loading TensorFlow checkpoint from {ckpt_dir}.")
 
-        if os.path.isfile(os.path.join(resume_from_checkpoint, WEIGHTS_NAME)):
-            # We load the model state dict on the CPU to avoid an OOM error.
-            state_dict = torch.load(
-                os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu"
-            )
-            state_dict = self._remap_state_dict(state_dict)
-            # workaround for FSDP bug https://github.com/pytorch/pytorch/issues/82963
-            # which takes *args instead of **kwargs
-            missing_keys, unexpected_keys = model.load_state_dict(
-                state_dict, strict=False
-            )
-            assert all(
-                [k.startswith("embedder.") for k in missing_keys]
-            ), f"invalid missing keys: {missing_keys}"
-            # release memory
-            del state_dict
-        else:
-            raise ValueError("error loading from checkpoint")
+        ckpt = tf.train.Checkpoint(model=model)
+        latest_ckpt = tf.train.latest_checkpoint(ckpt_dir)
+        if latest_ckpt is None:
+            raise ValueError(f"No TensorFlow checkpoint found in {ckpt_dir}")
+
+        status = ckpt.restore(latest_ckpt)
+        status.expect_partial() 
+
+        logger.info("Checkpoint restored successfully.")

@@ -1,73 +1,71 @@
 import math
-from typing import Dict
+from typing import Dict, Any, Optional
 
-import torch
-import torch.nn as nn
-import transformers
+import tensorflow as tf
+from transformers import TFTrainer
 
-from vec2text.trainers.base import BaseTrainer
+from .base_trainer_tf import BaseTrainer
 
 
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, **kwargs):
+    """Trainer for inversion tasks using a TF seq2seq model."""
+
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        ######################################################
+        # Copy tokenizers and embedder call
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
 
-    def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
+    def generate(
+        self,
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any]
+    ) -> tf.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
     def training_step(
-        self, model: nn.Module, inputs: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """
-        Performs a training step. we override to compute data-specific metrics.
-        """
-        # TODO: Log training metrics from below... (How to do with huggingface?)
-        # self._compute_data_metrics(inputs=inputs)
-        # self.log({ f"train/{k}": v for k,v in metrics.items() })
+        self,
+        model: tf.keras.Model,
+        inputs: Dict[str, tf.Tensor]
+    ) -> tf.Tensor:
+
         return super().training_step(model, inputs)
 
-    def evaluation_loop(
-        self, *args, **kwargs
-    ) -> transformers.trainer_utils.EvalLoopOutput:
-        """
-        Run evaluation and returns metrics.
+    def evaluate(
+        self,
+        eval_dataset: tf.data.Dataset = None,
+        ignore_keys: Optional[Any] = None,
+        metric_key_prefix: str = "eval",
+        **kwargs,
+    ) -> Dict[str, float]:
 
-        Override to compute ppl from eval loss.
-        """
-        output = super().evaluation_loop(*args, **kwargs)
+        # 1) run standard TFTrainer.evaluate
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+            **kwargs,
+        )
 
-        metric_key_prefix = kwargs["metric_key_prefix"]
+        # 2) compute perplexity
+        loss_key = f"{metric_key_prefix}_loss"
         try:
-            perplexity = math.exp(output.metrics[f"{metric_key_prefix}_loss"])
+            loss_val = metrics[loss_key]
+            ppl = math.exp(loss_val)
         except KeyError:
-            perplexity = -1
+            ppl = -1.0
         except OverflowError:
-            perplexity = float("inf")
-        output.metrics[f"{metric_key_prefix}_perplexity"] = perplexity
+            ppl = float("inf")
+        metrics[f"{metric_key_prefix}_perplexity"] = ppl
+        return metrics
 
-        return output
-
-    def _remap_state_dict(self, state_dict: Dict) -> Dict:
-        """Edit keys posthumously on model load."""
-        # Rename keys for backward compatibility w/ model trained before
-        # we added extra dropout to the model
-        if {
-            "embedding_transform.2.weight",
-            "embedding_transform.2.bias",
-        } <= state_dict.keys():
-            print(
-                "Renaming keys",
-                {"embedding_transform.2.weight", "embedding_transform.2.bias"},
-                "for backward compatibility.",
-            )
-            state_dict["embedding_transform.3.weight"] = state_dict.pop(
-                "embedding_transform.2.weight"
-            )
-            state_dict["embedding_transform.3.bias"] = state_dict.pop(
-                "embedding_transform.2.bias"
-            )
+    def _remap_state_dict(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        No state dict remapping needed in TF
+        """
         return state_dict

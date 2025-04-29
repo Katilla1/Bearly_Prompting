@@ -1,40 +1,61 @@
+# trainers/inversion_na_tf.py
 import math
-from typing import Dict
+from typing import Dict, Any, Optional
 
-import torch
-import transformers
+import tensorflow as tf
+from transformers import TFTrainer
 
-from vec2text.trainers.base import BaseTrainer
+from .base_trainer_tf import BaseTrainer
 
 
 class InversionTrainerNonAutoregressive(BaseTrainer):
-    def __init__(self, *args, **kwargs):
+    """Trainer for non-autoregressive inversion, with TensorFlow backend."""
+
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        ######################################################
+        # Copy tokenizers and embedder call
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
 
-    def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
+    def generate(
+        self,
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any]
+    ) -> tf.Tensor:
+        """Delegate to the TF seq2seq generate method."""
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
-    def evaluation_loop(
-        self, *args, **kwargs
-    ) -> transformers.trainer_utils.EvalLoopOutput:
+    def evaluate(
+        self,
+        eval_dataset: tf.data.Dataset = None,
+        ignore_keys: Optional[Any] = None,
+        metric_key_prefix: str = "eval",
+        **kwargs,
+    ) -> Dict[str, float]:
         """
-        Run evaluation and returns metrics.
-
-        Override to compute ppl from eval loss.
+        Run evaluation and returns metrics, then compute perplexity from loss.
         """
-        output = super().evaluation_loop(*args, **kwargs)
+        # 1) run standard TFTrainer.evaluate
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+            **kwargs,
+        )
 
-        metric_key_prefix = kwargs["metric_key_prefix"]
+        # 2) compute perplexity if possible
+        loss_key = f"{metric_key_prefix}_loss"
         try:
-            perplexity = math.exp(output.metrics[f"{metric_key_prefix}_loss"])
+            loss_val = metrics[loss_key]
+            ppl = math.exp(loss_val)
         except KeyError:
-            perplexity = -1
+            ppl = -1.0
         except OverflowError:
-            perplexity = float("inf")
-        output.metrics[f"{metric_key_prefix}_perplexity"] = perplexity
-
-        return output
+            ppl = float("inf")
+        metrics[f"{metric_key_prefix}_perplexity"] = ppl
+        return metrics
