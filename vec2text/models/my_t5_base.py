@@ -88,7 +88,7 @@ class T5SparseEncoderTF(TFT5ForConditionalGeneration):
 
         >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
         >>> model = T5Model.from_pretrained("t5-small")
-
+git b
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="tf"
         ... ).input_ids  # Batch size 1
