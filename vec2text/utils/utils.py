@@ -6,35 +6,37 @@ from typing import Callable
 
 import datasets
 import numpy as np
-import torch
+import tensorflow as tf
 import tqdm
 import transformers
 from tenacity import retry, stop_after_attempt, wait_fixed
-from torch.utils.data import Dataset
+#from torch.utils.data import Dataset
 import pickle
 
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 import datasets
 from typing import List, Union, Any, Dict
 import os
-from torch.utils.data import Dataset
+
+#import torch
+#from torch.utils.data import Dataset
 
 datasets.disable_caching()
 
-device = torch.device('cuda')
+#device = torch.device('cuda')
 
 
 def emb(
-    model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
-) -> torch.Tensor:
-    with torch.no_grad():
+    model: tf.keras.Model, input_ids: tf.Tensor, attention_mask: tf.Tensor
+) -> tf.Tensor:
+    with tf.no_gradient():
         emb = model.call_embedding_model(
             input_ids=input_ids, attention_mask=attention_mask
         )
     return emb
 
 
-def embed_all_tokens(model: torch.nn.Module, tokenizer: transformers.AutoTokenizer):
+def embed_all_tokens(model: tf.keras.Model, tokenizer: transformers.AutoTokenizer):
     """Generates embeddings for all tokens in tokenizer vocab."""
     i = 0
     model.embedder.eval()
@@ -55,29 +57,29 @@ def embed_all_tokens(model: torch.nn.Module, tokenizer: transformers.AutoTokeniz
     while i < V:
         #
         minibatch_size = min(V - i, batch_size)
-        inputs = torch.arange(i, min(i + minibatch_size, V))
+        inputs = tf.range(i, min(i + minibatch_size, V))
         #
         if CLS is not None:
-            input_ids = torch.stack(
+            input_ids = tf.stack(
                 [
-                    torch.tensor([CLS]).repeat(len(inputs)),
+                    tf.tensor([CLS]).repeat(len(inputs)),
                     inputs,
-                    torch.tensor([SEP]).repeat(len(inputs)),
+                    tf.tensor([SEP]).repeat(len(inputs)),
                 ]
             ).T
         else:
-            input_ids = torch.stack([inputs, torch.tensor([SEP]).repeat(len(inputs))]).T
+            input_ids = tf.stack([inputs, torch.tensor([SEP]).repeat(len(inputs))]).T
         input_ids = input_ids.to(device)
         #
-        attention_mask = torch.ones_like(input_ids, device=device)
+        attention_mask = tf.ones_like(input_ids, device=device)
         #
-        with torch.no_grad():
+        with tf.no_gradient():
             token_embeddings = emb(model, input_ids, attention_mask)
         all_token_embeddings.extend(token_embeddings)
         i += batch_size
         pbar.update(batch_size)
     #
-    all_token_embeddings_tensor: torch.Tensor = torch.stack(all_token_embeddings)
+    all_token_embeddings_tensor: tf.Tensor = tf.stack(all_token_embeddings)
     assert all_token_embeddings_tensor.shape == (tokenizer.vocab_size, 768)
 
     all_token_embeddings_tensor /= all_token_embeddings_tensor.norm(
@@ -86,43 +88,44 @@ def embed_all_tokens(model: torch.nn.Module, tokenizer: transformers.AutoTokeniz
     return all_token_embeddings_tensor
 
 
-def torch_main_worker_finish_first(func: Callable):
-    def wrapper(*args, **kwargs):
-        # Get local rank (need to support non-DDP).
-        try:
-            local_rank = torch.distributed.get_rank()
-            ddp_enabled = True
-        except (RuntimeError, ValueError):
-            local_rank = -1
-            ddp_enabled = False
-        is_main_worker = local_rank <= 0
-        # Run on main worker first.
-        if is_main_worker:
-            result = func(*args, **kwargs)
-        # Then everyone waits.
-        if ddp_enabled:
-            torch.distributed.barrier()
-        # Run on other workers now.
-        if not is_main_worker:
-            result = func(*args, **kwargs)
-        # Now everyone waits again.
-        if ddp_enabled:
-            torch.distributed.barrier()
-        return result
+# def torch_main_worker_finish_first(func: Callable):
+#     def wrapper(*args, **kwargs):
+#         # Get local rank (need to support non-DDP).
+#         try:
+#             local_rank = torch.distributed.get_rank()
+#             ddp_enabled = True
+#         except (RuntimeError, ValueError):
+#             local_rank = -1
+#             ddp_enabled = False
+#         is_main_worker = local_rank <= 0
+#         # Run on main worker first.
+#         if is_main_worker:
+#             result = func(*args, **kwargs)
+#         # Then everyone waits.
+#         if ddp_enabled:
+#             torch.distributed.barrier()
+#         # Run on other workers now.
+#         if not is_main_worker:
+#             result = func(*args, **kwargs)
+#         # Now everyone waits again.
+#         if ddp_enabled:
+#             torch.distributed.barrier()
+#         return result
 
-    return wrapper
+#     return wrapper
 
 
 def dataset_map_multi_worker(
     dataset: datasets.Dataset, map_fn: Callable, *args, **kwargs
 ) -> datasets.Dataset:
 
+    #tensorflow doesn't have get_rank or barrier, so a lot of this gets sacrificed
     try:
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
+        #rank = torch.distributed.get_rank()
+        #world_size = torch.distributed.get_world_size()
         # If not specified, use all of the CPUs we have available.
         kwargs["num_proc"] = kwargs.get(
-            "num_proc", len(os.sched_getaffinity(0)) // world_size
+            "num_proc", len(os.sched_getaffinity(0))
         )
     except (RuntimeError, ValueError):
         kwargs["num_proc"] = kwargs.get("num_proc", len(os.sched_getaffinity(0)))
@@ -132,30 +135,30 @@ def dataset_map_multi_worker(
         return dataset.map(map_fn, *args, **kwargs)
     datasets.disable_caching()
 
+
     cache_path = os.environ.get(
         "VEC2TEXT_CACHE", os.path.expanduser("/mnt/external_sdb/.cache/inversion")
     )
-    ds_shard_filepaths = [
-        os.path.join(cache_path, f"{dataset._fingerprint}_subshard_{w}.cache")
-        for w in range(0, world_size)
-    ]
-    print(f"\tworker {rank} saving sub-shard to {ds_shard_filepaths[rank]}")
-    ds_shard = dataset.shard(
-        num_shards=world_size,
-        index=rank,
-        contiguous=True,
-    )
-    ds_shard = ds_shard.map(map_fn, *args, **kwargs)
-    ds_shard.save_to_disk(ds_shard_filepaths[rank])
-    print("rank", rank, "saving:", ds_shard_filepaths[rank])
-    torch.distributed.barrier()
-    full_dataset = datasets.concatenate_datasets(
-        [datasets.load_from_disk(p) for p in ds_shard_filepaths]
-    )
-    torch.distributed.barrier()
-    print("rank", rank, "deleting:", ds_shard_filepaths[rank])
-    shutil.rmtree(ds_shard_filepaths[rank])
-    return full_dataset
+    ds_shard_filepath = os.path.join(cache_path, f"{dataset._fingerprint}_subshard_.cache")
+
+    print(f"Saving dataset to {ds_shard_filepath}")
+    # ds_shard = dataset.shard(
+    #     num_shards=world_size,
+    #     index=rank,
+    #     contiguous=True,
+    # )
+    # ds_shard = ds_shard.map(map_fn, *args, **kwargs)
+    dataset.save_to_disk(ds_shard_filepath)
+    # print("rank", rank, "saving:", ds_shard_filepaths[rank])
+    # torch.distributed.barrier()
+    # full_dataset = datasets.concatenate_datasets(
+    #     [datasets.load_from_disk(p) for p in ds_shard_filepaths]
+    # )
+    # torch.distributed.barrier()
+    # print("rank", rank, "deleting:", ds_shard_filepaths[rank])
+    # shutil.rmtree(ds_shard_filepaths[rank])
+    dataset = tf.data.Dataset.load(ds_shard_filepath)
+    return dataset
 
 
 manifest_object = None
@@ -249,14 +252,14 @@ def get_embeddings_openai_vanilla(text_list, model="text-embedding-ada-002") -> 
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutput
-import torch.nn.functional as F
+#import torch.nn.functional as F
 
 def compute_label_prob(model, tokenizer, input_ids, label_ids):
-    combined_ids = torch.cat((input_ids, label_ids), dim=1)
+    combined_ids = tf.concat((input_ids, label_ids), dim=1)
     output: CausalLMOutput = model(combined_ids)
     # there's one offset
     sliced_logits = output.logits[:, input_ids.shape[1] - 1: -1]
-    probabilities = F.softmax(sliced_logits, dim=-1)
+    probabilities = tf.nn.softmax(sliced_logits, dim=-1)
     print("combined ids")
     print(combined_ids.shape)
     print("sliced_logits")
@@ -268,8 +271,8 @@ def compute_label_prob(model, tokenizer, input_ids, label_ids):
     log_prob = 0
     print("start")
     indices = label_ids.unsqueeze(-1)
-    log_probs = torch.gather(probabilities, 2, indices).squeeze(-1)
-    sum_log_probs = torch.sum(torch.log(log_probs), dim=1)
+    log_probs = tf.gather(probabilities, 2, indices).squeeze(-1)
+    sum_log_probs = tf.sum(tf.log(log_probs), dim=1)
     print("log_probs")
     print(sum_log_probs)
     return sum_log_probs
@@ -302,10 +305,10 @@ def compute_kl(model_name, label_prompts, predicted_prompts):
 
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
 def embed_api(
-    input_ids: torch.Tensor,
+    input_ids: tf.Tensor,
     embedder_tokenizer: transformers.PreTrainedTokenizer,
     api_name: str,
-) -> torch.Tensor:
+) -> tf.Tensor:
     text_list = embedder_tokenizer.batch_decode(input_ids, skip_special_tokens=True)
 
     # get_embeddings_func = get_embeddings_openai_vanilla
@@ -319,7 +322,7 @@ def embed_api(
     else:
         raise ValueError(f"unsupported api name {api_name}")
 
-    return torch.tensor(embeddings, device=input_ids.device, dtype=torch.float32)
+    return tf.convert_to_tensor(embeddings, dtype=tf.float32)
 
 
 class MockEmbedder:
@@ -329,21 +332,19 @@ class MockEmbedder:
         self.embedder_dim = embedder_dim
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.zeros(
+        self, input_ids: tf.Tensor, attention_mask: tf.Tensor
+    ) -> tf.Tensor:
+        return tf.zeros(
             (input_ids.shape[0], input_ids.shape[1], self.embedder_dim),
-            dtype=torch.float32,
-            device=input_ids.device,
+            dtype=tf.float32,
         )
 
     def __call__(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.zeros(
+        self, input_ids: tf.Tensor, attention_mask: tf.Tensor
+    ) -> tf.Tensor:
+        return tf.zeros(
             (input_ids.shape[0], input_ids.shape[1], self.embedder_dim),
-            dtype=torch.float32,
-            device=input_ids.device,
+            dtype=tf.float32,
         )
 
 
@@ -381,17 +382,17 @@ class EntityMaskCollator(DataCollatorForLanguageModeling):
             end_token = prompt_enc.char_to_token(end_char_idx)
             # pad with -1, which is token for <pad>
             prompt_tokens = prompt_tokens + [1 for _ in range(max_batch_length - len(prompt_tokens))]
-            prompt_tokens = torch.tensor(prompt_tokens)
-            labels = torch.clone(prompt_tokens)
-            tokens_mask = torch.zeros_like(prompt_tokens, dtype=torch.bool)
+            prompt_tokens = tf.convert_to_tensor(prompt_tokens)
+            labels = tf.clone(prompt_tokens)
+            tokens_mask = tf.zeros_like(prompt_tokens, dtype=tf.bool)
             tokens_mask[start_token:end_token+1] = True
             prompt_tokens[tokens_mask] = 50264
             labels[tokens_mask == False] = -100
-            res['input_ids'].append(prompt_tokens.to(device))
-            res['labels'].append(labels.to(device))
-            res['logits'].append(examples[idx]['frozen_embeddings'].to(device))
+            res['input_ids'].append(prompt_tokens)
+            res['labels'].append(labels)
+            res['logits'].append(examples[idx]['frozen_embeddings'])
         for key in res.keys():
-            res[key] = torch.stack(res[key])
+            res[key] = tf.stack(res[key])
         return res
 
 
@@ -420,17 +421,17 @@ class T5EntityMaskCollator(DataCollatorForLanguageModeling):
             end_char_idx = start_char_idx + len(entity)
             new_prompt = f'{prompt[0:start_char_idx]} <extra_id_0> {prompt[end_char_idx:]}'
             new_entity = f'{new_prompt}<extra_id_0> {entity}'
-            new_prompt = torch.tensor(self.t5_tokenizer(new_prompt)['input_ids'])
-            new_entity = torch.tensor(self.t5_tokenizer(new_entity)['input_ids'])
-            res['decoder_input_ids'].append(new_prompt.to(device))
-            res['labels'].append(new_entity.to(device))
-            res['frozen_embeddings'].append(examples[idx]['frozen_embeddings'].to(device))
+            new_prompt = tf.convert_to_tensor(self.t5_tokenizer(new_prompt)['input_ids'])
+            new_entity = tf.convert_to_tensor(self.t5_tokenizer(new_entity)['input_ids'])
+            res['decoder_input_ids'].append(new_prompt)
+            res['labels'].append(new_entity)
+            res['frozen_embeddings'].append(examples[idx]['frozen_embeddings'])
         for key in res.keys():
-            res[key] = torch.stack(res[key])
+            res[key] = tf.stack(res[key])
         return res
     
 
-class DatasetFilter(Dataset):
+class DatasetFilter:
     """Face Landmarks dataset."""
 
     def __init__(self, full_dataset, idx_map_path):

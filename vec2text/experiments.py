@@ -9,7 +9,8 @@ import sys
 from typing import Dict, Optional
 
 import datasets
-import torch
+#import torch
+import tensorflow as tf
 import transformers
 
 import vec2text
@@ -49,7 +50,7 @@ os.environ["_WANDB_STARTUP_DEBUG"] = "true"
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
 # os.environ["TOKENIZERS_PARALLELISM"] = "True"
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 logger = logging.getLogger(__name__)
 
 # We maintain our own cache because huggingface datasets caching
@@ -60,11 +61,11 @@ DATASET_CACHE_PATH = os.environ.get(
 
 
 # Noisy compilation from torch.compile
-try:
-    torch._logging.set_logs(dynamo=logging.INFO)
-except AttributeError:
-    # torch version too low
-    pass
+# try:
+#     torch._logging.set_logs(dynamo=logging.INFO)
+# except AttributeError:
+#     # torch version too low
+#     pass
 
 
 def md5_hash_kwargs(**kwargs) -> str:
@@ -165,13 +166,11 @@ class Experiment(abc.ABC):
 
         # Save model_args and data_args before training. Trainer will save training_args.
         if training_args.local_rank <= 0:
-            torch.save(
-                self.data_args, os.path.join(training_args.output_dir, "data_args.bin")
-            )
-            torch.save(
-                self.model_args,
-                os.path.join(training_args.output_dir, "model_args.bin"),
-            )
+            import pickle #torch uses pickle in torch.save() but we have to do it manually
+            with open(os.path.join(training_args.output_dir, "data_args.bin"), "wb") as file:
+                pickle.dump(self.data_args, file)
+            with open(os.path.join(training_args.output_dir, "model_args.bin"), "wb") as file:
+                pickle.dump(self.model_args, file)
 
         # train.   :)
         print(f"train() called – resume-from_checkpoint = {checkpoint}")
@@ -254,10 +253,7 @@ class Experiment(abc.ABC):
 
     @property
     def _world_size(self) -> int:
-        try:
-            return torch.distributed.get_world_size()
-        except (RuntimeError, ValueError):
-            return 1
+        return 1
 
     @property
     def _is_main_worker(self) -> bool:
@@ -480,23 +476,23 @@ class Experiment(abc.ABC):
         # filter out empty examples (these exist for xsum documents).
         val_datasets_dict = val_datasets_dict.filter(lambda ex: ex["length"] > 1)
 
-        if self.model_args.use_frozen_embeddings_as_input:
-            assert torch.cuda.is_available()
-            model = model.to(device)
+        # if self.model_args.use_frozen_embeddings_as_input:
+        #     assert torch.cuda.is_available()
+        #     model = model.to(device)
 
-            new_tokenized_datasets = {}
-            for key, d in val_datasets_dict.items():
-                new_tokenized_datasets[key] = dataset_map_multi_worker(
-                    dataset=d,
-                    map_fn=functools.partial(embed_dataset_batch, model),
-                    batched=True,
-                    batch_size=self.training_args.per_device_train_batch_size,
-                    new_fingerprint=(
-                        d._fingerprint + md5_hash_kwargs(**self.dataset_kwargs) + ""
-                    ),
-                    num_proc=1,
-                )
-            val_datasets_dict = datasets.DatasetDict(new_tokenized_datasets)
+        #     new_tokenized_datasets = {}
+        #     for key, d in val_datasets_dict.items():
+        #         new_tokenized_datasets[key] = dataset_map_multi_worker(
+        #             dataset=d,
+        #             map_fn=functools.partial(embed_dataset_batch, model),
+        #             batched=True,
+        #             batch_size=self.training_args.per_device_train_batch_size,
+        #             new_fingerprint=(
+        #                 d._fingerprint + md5_hash_kwargs(**self.dataset_kwargs) + ""
+        #             ),
+        #             num_proc=1,
+        #         )
+        #     val_datasets_dict = datasets.DatasetDict(new_tokenized_datasets)
         return val_datasets_dict
 
     def _load_val_datasets_uncached(

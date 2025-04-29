@@ -1,7 +1,8 @@
 import copy
 from typing import List
 
-import torch
+#import torch
+import tensorflow as tf
 import transformers
 
 import vec2text
@@ -51,7 +52,7 @@ def load_corrector(embedder: str) -> vec2text.trainers.Corrector:
 
 
 def invert_embeddings(
-    embeddings: torch.Tensor,
+    embeddings: tf.Tensor,
     corrector: vec2text.trainers.Corrector,
     num_steps: int = None,
     sequence_beam_width: int = 0,
@@ -105,7 +106,7 @@ def invert_strings(
         padding="max_length",
     )
     inputs = inputs.to(device)
-    with torch.no_grad():
+    with tf.no_gradient():
         frozen_embeddings = corrector.inversion_trainer.call_embedding_model(
             input_ids=inputs.input_ids,
             attention_mask=inputs.attention_mask,

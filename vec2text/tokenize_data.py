@@ -1,6 +1,7 @@
 from typing import Callable, Dict
 
-import torch
+#import torch
+import tensorflow as tf
 import transformers
 
 from vec2text.models import InversionModel
@@ -13,7 +14,7 @@ def tokenize_function(
     max_seq_length: int,
     padding: bool = False,
 ) -> Callable[[Dict], Dict]:
-    def tokenize_function_inner(examples) -> Dict[str, torch.Tensor]:
+    def tokenize_function_inner(examples) -> Dict[str, tf.Tensor]:
         output = tokenizer(
             examples[text_column_name],
             padding=padding,
@@ -41,7 +42,7 @@ def tokenize_function(
         embedder_output = {f"embedder_{k}": v for k, v in embedder_output.items()}
 
         output["length"] = [
-            (torch.tensor(input_ids) != tokenizer.pad_token_id).sum().item()
+            (tf.convert_to_tensor(input_ids) != tokenizer.pad_token_id).sum().item()
             for input_ids in output["input_ids"]
         ]
 
@@ -59,7 +60,7 @@ def tokenize_function_llama_chat(
 ) -> Callable[[Dict], Dict]:
     """Use special tokenization for LLAMA chat models."""
 
-    def tokenize_function_inner(examples) -> Dict[str, torch.Tensor]:
+    def tokenize_function_inner(examples) -> Dict[str, tf.Tensor]:
         if "prefix" not in examples:
             # hacky way to turn datasets into the right format for LLAMA chat.
             # "real" prompt datasets like one_million_paired_instructions
@@ -103,7 +104,7 @@ def tokenize_function_llama_chat(
         embedder_output = {f"embedder_{k}": v for k, v in embedder_output.items()}
 
         output["length"] = [
-            (torch.tensor(input_ids) != tokenizer.pad_token_id).sum().item()
+            (tf.convert_to_tensor(input_ids) != tokenizer.pad_token_id).sum().item()
             for input_ids in output["input_ids"]
         ]
 
@@ -126,14 +127,14 @@ def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
         return_tensors="pt",
     ).to(next(model.parameters()).device)
 
-    with torch.no_grad():
+    with tf.no_gradient():
         batch["frozen_embeddings"] = model.get_frozen_embeddings(**emb_input_ids)
     return batch
 
 
 def get_tokenizer_mapping(
     lm: str, inverter: str, inverter_vocab_size: int
-) -> torch.Tensor:
+) -> tf.Tensor:
     """Computes the mapping from token outputs in `lm`'s vocabulary to those in `inverter's
     vocabulary. Makes some assumptions about spacing.
     """
@@ -141,7 +142,7 @@ def get_tokenizer_mapping(
     inverter_tokenizer = transformers.AutoTokenizer.from_pretrained(inverter)
 
     lm_vocab = lm_tokenizer.vocab
-    mapping = torch.zeros(len(lm_vocab), dtype=torch.long)
+    mapping = tf.zeros(len(lm_vocab), dtype=tf.long)
     for k, idx in lm_tokenizer.vocab.items():
         # We replace space tokens with nothing and allow the call to
         # inverter_tokenizer.decode to determine this. We also

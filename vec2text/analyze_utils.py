@@ -5,7 +5,8 @@ import shlex
 from typing import Optional
 
 import pandas as pd
-import torch
+#import torch
+import tensorflow as tf
 import transformers
 from transformers import HfArgumentParser
 from transformers.trainer_utils import get_last_checkpoint
@@ -14,7 +15,7 @@ from vec2text import experiments
 from vec2text.models.config import InversionConfig
 from vec2text.run_args import DataArguments, ModelArguments, TrainingArguments
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 transformers.logging.set_verbosity_error()
 
 #############################################################################
@@ -32,6 +33,7 @@ def load_experiment_and_trainer(
     # import previous aliases so that .bin that were saved prior to the
     # existence of the vec2text module will still work.
     import sys
+    import pickle
 
     import vec2text.run_args as run_args
 
@@ -56,27 +58,32 @@ def load_experiment_and_trainer(
         )
     else:
         try:
-            data_args = torch.load(os.path.join(checkpoint, os.pardir, "data_args.bin"))
+            #data_args = torch.load(os.path.join(checkpoint, os.pardir, "data_args.bin"))
+            #torch.load like torch.save is not in tf, we have to do it manually with pickle
+            with open(os.path.join(checkpoint, os.pardir, "data_args.bin"), "rb") as file:
+                data_args = pickle.load(file)
         except FileNotFoundError:
-            data_args = torch.load(os.path.join(checkpoint, "data_args.bin"))
+            with open(os.path.join(checkpoint, "data_args.bin"), "rb") as file:
+                data_args = pickle.load(file)
         try:
-            model_args = torch.load(
-                os.path.join(checkpoint, os.pardir, "model_args.bin")
-            )
+            with open(os.path.join(checkpoint, os.pardir, "model_args.bin"), "rb") as file:
+                model_args = pickle.load(file)
         except FileNotFoundError:
-            model_args = torch.load(os.path.join(checkpoint, "model_args.bin"))
+            with open(os.path.join(checkpoint, "model_args.bin"), "rb") as file:
+                model_args = pickle.load(file)
         try:
-            training_args = torch.load(
-                os.path.join(checkpoint, os.pardir, "training_args.bin")
-            )
+            with open(os.path.join(checkpoint, os.pardir, "training_args.bin"), "rb") as file:
+                training_args = pickle.load(file)
         except FileNotFoundError:
-            training_args = torch.load(os.path.join(checkpoint, "training_args.bin"))
+            with open(os.path.join(checkpoint, "training_args.bin"), "rb") as file:
+                training_args = pickle.load(file)
 
     training_args.dataloader_num_workers = 0  # no multiprocessing :)
     training_args.use_wandb = False
     training_args.report_to = []
     training_args.mock_embedder = False
-    training_args.no_cuda = not torch.cuda.is_available()
+    #training_args.no_cuda = not torch.cuda.is_available()
+    training_args.no_cuda = True
 
     if max_seq_length is not None:
         print(
@@ -115,8 +122,8 @@ def load_experiment_and_trainer(
         trainer.model.layernorm = None
         # try again without trying to load layernorm
         trainer._load_from_checkpoint(checkpoint)
-    if torch.cuda.is_available() and sanity_decode:
-        trainer.sanity_decode()
+    #if torch.cuda.is_available() and sanity_decode:
+    #    trainer.sanity_decode()
     return experiment, trainer
 
 
@@ -157,7 +164,8 @@ def load_experiment_and_trainer_from_pretrained(name: str, use_less_data: int = 
     #######################################################################
     from accelerate.state import PartialState
 
-    training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    #training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    training_args._n_gpu = 0  # Don't load in DDP
     training_args.bf16 = 0  # no bf16 in case no support from GPU
     training_args.local_rank = -1  # Don't load in DDP
     training_args.distributed_state = PartialState()
@@ -187,7 +195,8 @@ def load_experiment_from_config(name, config, use_less_data: int = 1000):
     #######################################################################
     from accelerate.state import PartialState
 
-    training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    #training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    training_args._n_gpu = 0  # Don't load in DDP
     training_args.bf16 = 0  # no bf16 in case no support from GPU
     training_args.local_rank = -1  # Don't load in DDP
     training_args.distributed_state = PartialState()
@@ -216,7 +225,8 @@ def load_experiment(name: str, use_less_data: int = 1000):
     #######################################################################
     from accelerate.state import PartialState
 
-    training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    #training_args._n_gpu = 1 if torch.cuda.is_available() else 0  # Don't load in DDP
+    training_args._n_gpu = 0  # Don't load in DDP
     training_args.bf16 = 0  # no bf16 in case no support from GPU
     training_args.local_rank = -1  # Don't load in DDP
     training_args.distributed_state = PartialState()

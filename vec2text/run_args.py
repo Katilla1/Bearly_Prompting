@@ -2,7 +2,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-import torch
+#import torch
+import tensorflow as tf
 import transformers
 from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
 
@@ -367,7 +368,7 @@ class TrainingArguments(transformers.TrainingArguments):
             ["wandb"] if (self.use_wandb and (self.local_rank <= 0)) else []
         )
         self.dataloader_pin_memory = True
-        num_workers = torch.cuda.device_count()
+        num_workers = 0 #may need to change to 1 if there are GPUs available
         os.environ["RAYON_RS_NUM_CPUS"] = str(
             num_workers
         )  # Sets threads for hf tokenizers

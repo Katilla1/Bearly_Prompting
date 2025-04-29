@@ -4,7 +4,8 @@ import random
 from typing import Dict, List
 
 import datasets
-import torch
+#import torch
+import tensorflow as tf
 
 from vec2text.run_args import DataArguments
 from vec2text.utils import dataset_map_multi_worker
@@ -41,11 +42,11 @@ def create_ompi_ex(ex: Dict[str, str]) -> Dict[str, str]:
     return ex
 
 
-def get_world_size() -> int:
-    try:
-        return torch.distributed.get_world_size()
-    except (RuntimeError, ValueError):
-        return 1
+# def get_world_size() -> int:
+#     try:
+#         return torch.distributed.get_world_size()
+#     except (RuntimeError, ValueError):
+#         return 1
 
 
 def load_one_million_paired_instructions() -> datasets.Dataset:
@@ -55,7 +56,8 @@ def load_one_million_paired_instructions() -> datasets.Dataset:
     dataset_dict = dataset_map_multi_worker(
         dataset_dict,
         map_fn=create_ompi_ex,
-        num_proc=(len(os.sched_getaffinity(0)) // get_world_size()),
+        #num_proc=(len(os.sched_getaffinity(0)) // get_world_size()),
+        num_proc=(len(os.sched_getaffinity(0))),
     )
 
     return dataset_dict["train"]
