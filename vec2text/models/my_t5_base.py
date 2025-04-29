@@ -4,7 +4,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from transformers import TFT5ForConditionalGeneration, T5Tokenizer
-from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
+from transformers.modeling_tf_outputs import TFBaseModelOutput, TFSeq2SeqLMOutput
 
 
 class T5SparseEncoder(TFT5ForConditionalGeneration):
@@ -54,7 +54,7 @@ class T5SparseEncoder(TFT5ForConditionalGeneration):
         attentions = None
         if output_attentions:
             attentions = encoder_outputs.attentions
-        return BaseModelOutput(
+        return TFBaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=None,
             attentions=attentions
@@ -69,7 +69,7 @@ class T5SparseEncoder(TFT5ForConditionalGeneration):
         head_mask: Optional[tf.Tensor] = None,
         decoder_head_mask: Optional[tf.Tensor] = None,
         cross_attn_head_mask: Optional[tf.Tensor] = None,
-        encoder_outputs: Optional[BaseModelOutput] = None,
+        encoder_outputs: Optional[TFBaseModelOutput] = None,
         past_key_values: Optional[Tuple[tf.Tensor]] = None,
         inputs_embeds: Optional[tf.Tensor] = None,
         decoder_inputs_embeds: Optional[tf.Tensor] = None,
@@ -79,7 +79,7 @@ class T5SparseEncoder(TFT5ForConditionalGeneration):
         return_dict: Optional[bool] = None,
         labels: Optional[tf.Tensor] = None,
         **kwargs
-    ) -> Union[Tuple[tf.Tensor], Seq2SeqLMOutput]:
+    ) -> Union[Tuple[tf.Tensor], TFSeq2SeqLMOutput]:
         r"""
         Returns:
 
@@ -90,7 +90,7 @@ class T5SparseEncoder(TFT5ForConditionalGeneration):
 
         >>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
         >>> model = T5Model.from_pretrained("t5-small")
-git b
+        
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="tf"
         ... ).input_ids  # Batch size 1
@@ -141,7 +141,7 @@ git b
         if not return_dict:
             output = (lm_logits,) + decoder_outputs[1:] + (encoder_outputs,)
             return ((loss,) + output) if loss is not None else output
-        return Seq2SeqLMOutput(
+        return TFSeq2SeqLMOutput(
             loss=loss,
             logits=lm_logits,
             past_key_values=decoder_outputs.past_key_values,
@@ -190,7 +190,7 @@ git b
         encoder_kwargs[model_input_name] = inputs_tensor
 
         hidden_states = self.my_encoder(inputs_tensor)
-        encoder_outputs = BaseModelOutput(
+        encoder_outputs = TFBaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=None,
             attentions=None
