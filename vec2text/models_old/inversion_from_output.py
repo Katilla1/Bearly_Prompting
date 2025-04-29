@@ -1,7 +1,8 @@
 import copy
 from typing import Dict, Optional, Tuple
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import transformers
 
 from vec2text.models.config import InversionConfig
@@ -13,26 +14,26 @@ import numpy as np
 class InversionFromOutputModel(InversionFromLogitsEmbModel):
     def generate(
         self,
-        inputs: Dict[str, tf.Tensor],
-        generation_kwargs: Dict[str, tf.Tensor],
-    ) -> tf.Tensor:
+        inputs: Dict[str, torch.Tensor],
+        generation_kwargs: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # tokenizer = AutoTokenizer.from_pretrained('t5-base')
+        # print(tokenizer.batch_decode(inputs['input_ids']))
         return self.encoder_decoder.generate(
             input_ids=inputs['input_ids'],
-            attention_mask=tf.ones_like(inputs['attention_mask']),
+            attention_mask=torch.ones_like(inputs['attention_mask']),
             **generation_kwargs
         )
 
-    def call(
+    def forward(
         self,
-        input_ids: tf.Tensor = None,
-        attention_mask: tf.Tensor = None,
-        labels: Optional[tf.Tensor] = None,
-        training: bool = False,
+        input_ids: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        labels: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Dict[str, tf.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         return self.encoder_decoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            training=training,
         )

@@ -2,7 +2,8 @@ import copy
 import logging
 from typing import Dict, Optional, Tuple
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -20,9 +21,32 @@ from vec2text.utils import embed_api
 
 logger = logging.getLogger(__name__)
 
+
+# TODO: can we make this class a HF pretrained model so it works nicely with
+# .push_to_hub(), etc.?
+# TODO: Need config to subclass transformers.PreTrainedModel.
 class InversionModel(transformers.PreTrainedModel):
+    """A class of model that conditions on embeddings from a pre-trained sentence embedding model
+    to decode text autoregressively.
+    """
+
     config_class = InversionConfig
-    
+    embedder: nn.Module
+    embedder_tokenizer: transformers.PreTrainedTokenizer  # embedder's tokenizer
+    encoder_decoder: transformers.AutoModelForSeq2SeqLM
+    encoder_decoder_lora: bool  # Whether to use LoRA for the encoder-decoder model
+    tokenizer: transformers.PreTrainedTokenizer  # encoder_decoder's tokenizer
+    embedding_transform: nn.Module  # Module that transformers embedder output into encoder-decoder input
+    bottleneck_dim: int  # Bottleneck dimension for embedding_transform
+    num_repeat_tokens: int  # Sequence length for repeating embedder embedding for encoder-decoder input
+    embedder_dim: int  # Hidden dimension of embedding model
+    embedder_no_grad: bool  # Disable gradients for embedding model
+    embedder_fake_with_zeros: bool  # Whether to just provide zeros as input for encoder-decoder (unconditional)
+    embedding_transform_strategy: str  # Way to transform bottleneck embedding into input for encoder-decoder
+    use_frozen_embeddings_as_input: bool  # Whether to train/evaluate on frozen embeddings
+    embedded_tokens: torch.Tensor  # used for decoding
+    embedder_model_api: Optional[str]
+
     def __init__(self, config: InversionConfig):
         super().__init__(config=config)
 
@@ -49,13 +73,16 @@ class InversionModel(transformers.PreTrainedModel):
         num_repeat_tokens = config.num_repeat_tokens
         embedder_no_grad = config.embedder_no_grad
 
-        self.encoder_decoder = encoder_decoder
+        self.encoder_decoder = encoder_decoder  # .to_bettertransformer()
+        ######################################################
         self.num_repeat_tokens = num_repeat_tokens
+
         self.embedder_is_decoder = False
 
         encoder_hidden_dim = self.encoder_decoder.config.hidden_size
         if embedder_model_api:
             assert use_frozen_embeddings_as_input, "must precompute embeddings w/ api"
+            # Hard-code OpenAI embedding dim
             self.embedder_dim = 1536
             bottleneck_dim = self.embedder_dim
         elif isinstance(embedder, SentenceTransformer):
@@ -68,25 +95,26 @@ class InversionModel(transformers.PreTrainedModel):
         self.use_frozen_embeddings_as_input = use_frozen_embeddings_as_input
         self.bottleneck_dim = bottleneck_dim
 
-        self.embedding_transform = tf.keras.Sequential([
-            tf.keras.layers.Dense(bottleneck_dim),
-            tf.keras.layers.Dropout(self.encoder_decoder.config.dropout_rate),
-            tf.keras.layers.Activation('gelu'),
-            tf.keras.layers.Dense(encoder_hidden_dim * num_repeat_tokens),
-        ])
-        
+        self.embedding_transform = nn.Sequential(
+            nn.Linear(self.embedder_dim, bottleneck_dim),
+            nn.Dropout(self.encoder_decoder.config.dropout_rate),
+            nn.GELU(),  # TODO consider dropout or normalization here.
+            nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
+        )
         if encoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.encoder)
         if decoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.decoder)
             disable_dropout(self.encoder_decoder.lm_head)
-        
+        ######################################################
         self.tokenizer = tokenizer
         self.embedder = embedder
         self.embedder_tokenizer = embedder_tokenizer
         self.embedder_model_api = embedder_model_api
+        # self.freeze(freeze_strategy=config.freeze_strategy)
         self.embedder_fake_with_zeros = embedder_fake_with_zeros
-        self.embedding_transform_strategy = "repeat"
+
+        self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = 0
 
@@ -94,6 +122,7 @@ class InversionModel(transformers.PreTrainedModel):
         freeze_params(self.encoder_decoder.encoder)
 
     def _freeze_decoder(self):
+        # github.com/huggingface/transformers/blob/master/src/transformers/models/t5/modeling_t5.py#L1229-L1231
         freeze_params(self.encoder_decoder.decoder)
         freeze_params(self.encoder_decoder.lm_head)
 
@@ -107,6 +136,7 @@ class InversionModel(transformers.PreTrainedModel):
         elif freeze_strategy == "encoder_and_decoder":
             self._freeze_encoder()
             self._freeze_decoder()
+            # in this case, freeze embeddings too
             freeze_params(self.encoder_decoder.shared)
         elif freeze_strategy == "none":
             pass
@@ -114,14 +144,14 @@ class InversionModel(transformers.PreTrainedModel):
             raise ValueError(f"invalid freezing strategy {freeze_strategy}")
 
     @property
-    def embedder_device(self):
-        return "/device:GPU:0"
+    def embedder_device(self) -> torch.device:
+        return next(self.embedder.parameters()).device
 
     def _process_embedder_output(
         self,
         outputs: transformers.modeling_outputs.BaseModelOutput,
-        attention_mask: tf.Tensor,
-    ) -> tf.Tensor:
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         if hasattr(outputs, "pooler_output") and (outputs.pooler_output is not None):
             return outputs.pooler_output
         else:
@@ -133,24 +163,27 @@ class InversionModel(transformers.PreTrainedModel):
                 embeddings = mean_pool(hidden_state, attention_mask)
             else:
                 hidden_state = outputs.last_hidden_state
+                # Note: why do we need mean pool here?
                 embeddings = mean_pool(hidden_state, attention_mask)
             return embeddings
 
     def call_embedding_model(
         self,
-        input_ids: tf.Tensor,
-        attention_mask: tf.Tensor,
-    ) -> tf.Tensor:
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        # token_type_ids: Optional[torch.Tensor] = None, # not used
+    ) -> torch.Tensor:
         embedder = self.embedder
-        
+        # print("** call_embedding_model")
         if self.embedder_no_grad:
             embedder.eval()
 
         if self.embedder_fake_with_zeros:
-            batch_size = tf.shape(input_ids)[0]
-            return tf.zeros(
+            batch_size = input_ids.shape[0]
+            return torch.zeros(
                 (batch_size, self.embedder_dim),
-                dtype=tf.float32,
+                dtype=torch.float32,
+                device=self.embedder_device,
             )
         elif self.embedder_model_api:
             embeddings = embed_api(
@@ -159,6 +192,7 @@ class InversionModel(transformers.PreTrainedModel):
                 api_name=self.embedder_model_api,
             )
         elif isinstance(self.embedder, SentenceTransformer):
+            # sentence-transformers is kind of really annoying
             model_output = embedder(
                 {"input_ids": input_ids, "attention_mask": attention_mask}
             )
@@ -168,26 +202,28 @@ class InversionModel(transformers.PreTrainedModel):
             embeddings = self._process_embedder_output(model_output, attention_mask)
 
         if self.noise_level > 0:
-            embeddings += self.noise_level * tf.random.normal(
-                tf.shape(embeddings)
+            embeddings += self.noise_level * torch.randn(
+                embeddings.shape, device=embeddings.device
             )
         return embeddings
 
     def embed_and_project(
         self,
-        embedder_input_ids: Optional[tf.Tensor],
-        embedder_attention_mask: Optional[tf.Tensor],
-        frozen_embeddings: Optional[tf.Tensor] = None,
-    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        embedder_input_ids: Optional[torch.Tensor],
+        embedder_attention_mask: Optional[torch.Tensor],
+        frozen_embeddings: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print("** embed_and_project")
         assert not ((embedder_input_ids is None) and (frozen_embeddings is None))
         if frozen_embeddings is not None:
             embeddings = frozen_embeddings
-            assert len(tf.shape(embeddings)) == 2
+            assert len(embeddings.shape) == 2  # batch by d
         elif self.embedder_no_grad:
-            embeddings = self.call_embedding_model(
-                input_ids=embedder_input_ids,
-                attention_mask=embedder_attention_mask,
-            )
+            with torch.no_grad():
+                embeddings = self.call_embedding_model(
+                    input_ids=embedder_input_ids,
+                    attention_mask=embedder_attention_mask,
+                )
         else:
             embeddings = self.call_embedding_model(
                 input_ids=embedder_input_ids,
@@ -195,25 +231,28 @@ class InversionModel(transformers.PreTrainedModel):
             )
         if self.embedding_transform_strategy == "repeat":
             repeated_embeddings = self.embedding_transform(embeddings)
-            shape = tf.concat([tf.shape(repeated_embeddings)[:-1], [self.num_repeat_tokens, -1]], axis=0)
-            embeddings = tf.reshape(repeated_embeddings, shape)
+            # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
+            embeddings = repeated_embeddings.reshape(
+                (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
+            )
         elif self.embedding_transform_strategy == "nearest_neighbors":
+            # TODO
             raise NotImplementedError()
         else:
             raise ValueError(
                 f"unknown embedding transformation strategy {self.embedding_transform_strategy}"
             )
-        attention_mask = tf.ones(
-            (tf.shape(embeddings)[0], tf.shape(embeddings)[1])
+        attention_mask = torch.ones(
+            (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
         )
         return embeddings, attention_mask
 
     def generate(
         self,
-        inputs: Dict[str, tf.Tensor],
-        generation_kwargs: Dict[str, tf.Tensor],
-    ) -> tf.Tensor:
-        generation_kwargs = copy.copy(generation_kwargs)
+        inputs: Dict[str, torch.Tensor],
+        generation_kwargs: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        generation_kwargs = copy.copy(generation_kwargs)  # make a copy so we can edit
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=inputs.get("embedder_input_ids"),
             embedder_attention_mask=inputs.get("embedder_attention_mask"),
@@ -222,28 +261,37 @@ class InversionModel(transformers.PreTrainedModel):
 
         if "decoder_input_ids" in inputs:
             return self.encoder_decoder.generate(
+                # required: input embeddings
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
                 decoder_input_ids=inputs["decoder_input_ids"],
+                # decoder_attention_mask=inputs["decoder_attention_mask"],
                 **generation_kwargs,
             )
         else:
             return self.encoder_decoder.generate(
+                # required: input embeddings
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
                 **generation_kwargs,
             )
 
-    def call(
+    def forward(
         self,
-        embedder_input_ids: tf.Tensor,
-        embedder_attention_mask: tf.Tensor,
-        labels: Optional[tf.Tensor] = None,
-        frozen_embeddings: Optional[tf.Tensor] = None,
-        decoder_input_ids: Optional[tf.Tensor] = None,
-        training: Optional[bool] = None,
+        embedder_input_ids: torch.Tensor,
+        embedder_attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        frozen_embeddings: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Dict[str, tf.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
+        # Unused: input_ids, attention_mask
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=embedder_input_ids,
             embedder_attention_mask=embedder_attention_mask,
@@ -254,5 +302,4 @@ class InversionModel(transformers.PreTrainedModel):
             attention_mask=attention_mask,
             labels=labels,
             decoder_input_ids=decoder_input_ids,
-            training=training,
         )

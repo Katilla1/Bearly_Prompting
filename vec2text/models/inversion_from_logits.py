@@ -1,9 +1,10 @@
 import copy
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
-import torch
-import torch.nn as nn
 import transformers
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, activations
 
 from vec2text.models.config import InversionConfig
 from vec2text.models.inversion import InversionModel
@@ -15,112 +16,116 @@ LOGIT_FILTER_VALUE = -1 * 10**7
 
 
 def zero_embedding_except_topk(
-    embeddings: torch.Tensor, vocab_size: int, k: torch.Tensor, default_val: float
-) -> torch.Tensor:
-    # return embeddings
-    topk = embeddings[:, :vocab_size].topk(k=k, dim=1)
-    new_emb = torch.zeros_like(embeddings, device=embeddings.device) + default_val
-    return new_emb.scatter_add(1, topk.indices, topk.values)
+    embeddings: tf.Tensor,
+    vocab_size: int,
+    k: int,
+    default_val: float,
+) -> tf.Tensor:
+    topk = tf.math.top_k(embeddings[:, :vocab_size], k=k, sorted=False)
+    values, indices = topk.values, topk.indices
+    new_emb = tf.fill(tf.shape(embeddings), default_val)
+    batch_size = tf.shape(embeddings)[0]
+    batch_idx = tf.broadcast_to(
+        tf.reshape(tf.range(batch_size), [batch_size, 1]), [batch_size, k]
+    )
+    scatter_idx = tf.stack([batch_idx, indices], axis=2)
+    updates = tf.scatter_nd(
+        tf.reshape(scatter_idx, [-1, 2]), 
+        tf.reshape(values, [-1]), 
+        tf.shape(embeddings)
+    )
+    return new_emb + updates
 
 
 class InversionFromLogitsModel(InversionModel):
     def __init__(self, config: InversionConfig):
-        super().__init__(config=config)
-        # hacky way of checking if model is a pre-trained HF decoder
-        assert ("CausalLM" in str(type(self.embedder))) or (
-            "LMHead" in str(type(self.embedder))
-        )
-        encoder_hidden_dim = self.encoder_decoder.config.hidden_size
-        self.encoder_hidden_dim = encoder_hidden_dim
+        super().__init__(config)
+        assert hasattr(self.embedder, "generate")  
+        H = self.encoder_decoder.config.hidden_size
+        self.encoder_hidden_dim = H
         self.embedder_is_decoder = True
-        bottleneck_dim = self.bottleneck_dim
-
-        self.num_zeros_to_add = encoder_hidden_dim - (
-            (self.embedder.config.vocab_size + encoder_hidden_dim) % encoder_hidden_dim
-        )
-        self.num_repeat_tokens = round(
-            (self.embedder.config.vocab_size + self.num_zeros_to_add)
-            / encoder_hidden_dim
-        )
-        self.embedding_transform = nn.Sequential(
-            nn.Linear(encoder_hidden_dim, bottleneck_dim),
-            nn.Dropout(self.encoder_decoder.config.dropout_rate),
-            nn.GELU(),
-            nn.Linear(bottleneck_dim, encoder_hidden_dim),
-        )
-        self.sequence_weights = nn.Parameter(
-            torch.randn(
-                (self.num_repeat_tokens, encoder_hidden_dim, encoder_hidden_dim),
-                dtype=torch.float32,
+        vocab = self.embedder.config.vocab_size
+        self.num_zeros_to_add = H - ((vocab + H) % H)
+        self.num_repeat_tokens = (vocab + self.num_zeros_to_add) // H
+        bottleneck = self.bottleneck_dim
+        self.embedding_transform = tf.keras.Sequential([
+            layers.Dense(bottleneck, input_shape=(None, H)),
+            layers.Dropout(self.encoder_decoder.config.dropout_rate),
+            layers.Activation(activations.gelu),
+            layers.Dense(H),
+        ])
+        self.sequence_weights = tf.Variable(
+            tf.random.normal(
+                [self.num_repeat_tokens, H, H], dtype=tf.float32
             ),
-            requires_grad=True,
+            trainable=True,
+            name="sequence_weights",
         )
-
-        self.unigram_beta = 0.01  # How much to update unigram with each batch
-        self.unigram = nn.Parameter(
-            torch.zeros(
-                (1, self.embedder.config.vocab_size + self.num_zeros_to_add),
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
+        self.unigram_beta = 0.01
+        self.unigram = tf.Variable(
+            tf.zeros([1, vocab + self.num_zeros_to_add], dtype=tf.float32),
+            trainable=False,
+            name="unigram",
         )
-        self._zero_except_topk = vars(config).get("embedding_zero_except_topk")
-        print("Set zero-except-top-K value =", self._zero_except_topk)
-        self._emb_top_p = None
+        self._zero_except_topk = getattr(config, "embedding_zero_except_topk", None)
         self._emb_top_k = None
+        self._emb_top_p = None
         self._emb_temp = None
         self._softmax_in_log_space = True
 
     def call_embedding_model(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        embedder = self.embedder
-
-        inputs_str = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-        emb_input_ids = self.embedder_tokenizer(
-            inputs_str,
+        input_ids: tf.Tensor,
+        attention_mask: tf.Tensor,
+    ) -> tf.Tensor:
+        input_strs = self.tokenizer.batch_decode(
+            input_ids.numpy().tolist(),
+            skip_special_tokens=True,
+        )
+        emb_inputs = self.embedder_tokenizer(
+            input_strs,
             max_length=self.config.max_seq_length,
-            truncation=True,
             padding="max_length",
-            return_tensors="pt",
-        ).to(next(self.parameters()).device)
-
-        model_output = embedder(**emb_input_ids)
-        return self._process_embedder_output(model_output, emb_input_ids.attention_mask)
-
+            truncation=True,
+            return_tensors="tf",
+        )
+        outputs = self.embedder(
+            input_ids=emb_inputs["input_ids"],
+            attention_mask=emb_inputs["attention_mask"],
+        )
+        return self._process_embedder_output(
+            outputs,
+            emb_inputs["attention_mask"],
+        )
+    
     def embed_and_project(
         self,
-        input_ids: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        frozen_embeddings: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Note: call the embedder
+        input_ids: Optional[tf.Tensor],
+        attention_mask: Optional[tf.Tensor],
+        frozen_embeddings: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
         if frozen_embeddings is not None:
             embeddings = frozen_embeddings
-            assert len(embeddings.shape) == 2  # batch by d
         elif self.embedder_no_grad:
-            with torch.no_grad():
-                embeddings = self.call_embedding_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
+            embeddings = tf.stop_gradient(self.call_embedding_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ))
         else:
             embeddings = self.call_embedding_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
 
-        embeddings = embeddings.to(self.sequence_weights.dtype)
+        embeddings = tf.cast(embeddings, self.sequence_weights.dtype)
 
-        if self.training:
-            # Update unigram.
-            unigram_batch = embeddings.mean(dim=0, keepdim=True)
-            self.unigram.data = self.unigram.data * (
-                1 - self.unigram_beta
-            ) + unigram_batch * (self.unigram_beta)
-        embeddings -= self.unigram
+        if self.trainable and hasattr(self, "unigram"):
+            batch_unigram = tf.reduce_mean(embeddings, axis=0, keepdims=True)
+            self.unigram.assign(
+                (1 - self.unigram_beta) * self.unigram + self.unigram_beta * batch_unigram
+            )
+
+        embeddings = embeddings - self.unigram
 
         if self._zero_except_topk is not None:
             embeddings = zero_embedding_except_topk(
@@ -130,119 +135,102 @@ class InversionFromLogitsModel(InversionModel):
                 default_val=-30.0,
             )
 
-        embeddings = embeddings.to(self.sequence_weights.dtype)
-        embeddings = embeddings.reshape(
-            (embeddings.shape[0], self.num_repeat_tokens, self.encoder_hidden_dim)
-        )
-        embeddings = torch.einsum("bsd,sdw->bsw", embeddings, self.sequence_weights)
-        embeddings = embeddings.to(next(self.embedding_transform.parameters()).dtype)
-        embeddings = self.embedding_transform(embeddings)
-        attention_mask = torch.ones(
-            (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
+        B = tf.shape(embeddings)[0]
+        D = tf.shape(embeddings)[1]
+        embeddings = tf.reshape(
+            embeddings,
+            [B, self.num_repeat_tokens, self.encoder_hidden_dim]
         )
 
-        assert embeddings.shape == (
-            attention_mask.shape[0],
-            attention_mask.shape[1],
-            self.encoder_hidden_dim,
-        )
+        embeddings = tf.einsum("bsd,sdw->bsw", embeddings, self.sequence_weights)
+
+        embeddings = self.embedding_transform(embeddings)
+
+        attention_mask = tf.ones([tf.shape(embeddings)[0], tf.shape(embeddings)[1]], tf.int32)
+
         return embeddings, attention_mask
 
     def _process_embedder_output(
         self,
-        outputs: transformers.modeling_outputs.BaseModelOutput,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        B = len(attention_mask)
-        logits = outputs.logits[torch.arange(B), attention_mask.sum(1) - 1]
-
-        logit_filter_value = logits.min()
+        outputs: transformers.modeling_outputs.Seq2SeqLMOutput,
+        attention_mask: tf.Tensor,
+    ) -> tf.Tensor:
+        logits = outputs.logits
+        lengths = tf.reduce_sum(attention_mask, axis=1)
+        batch_idx = tf.range(tf.shape(logits)[0])
+        time_idx = lengths - 1
+        final_logits = tf.gather_nd(
+            logits,
+            tf.stack([batch_idx, time_idx], axis=1)
+        )
 
         if self._emb_top_k is not None:
-            topk = logits.topk(k=min(logits.shape[1], self._emb_top_k), dim=1)
-            logits = torch.zeros_like(logits, device=logits.device)
-            logits = logits.scatter_add(1, topk.indices, topk.values)
-            logits = logits.where(logits != 0, logit_filter_value)
+            topk = tf.math.top_k(final_logits, k=self._emb_top_k, sorted=False)
+            mask = tf.scatter_nd(
+                tf.expand_dims(topk.indices, -1),
+                tf.ones_like(topk.values),
+                tf.shape(final_logits)
+            )
+            filtered = tf.where(mask>0, final_logits, LOGIT_FILTER_VALUE)
+            final_logits = filtered
 
         if self._emb_top_p is not None:
-            for j in range(len(logits)):
-                sorted_logits, sorted_indices = logits[j].sort(descending=True)
-                cumulative_probs = sorted_logits.softmax(dim=0).cumsum(dim=0)
-                topp_idxs = sorted_indices[cumulative_probs >= self._emb_top_p]
-                logits[j] = logits[j].scatter(
-                    dim=0, index=topp_idxs, value=logit_filter_value
-                )
+            probs = tf.nn.softmax(final_logits, axis=1)
+            sorted_p, sorted_idx = tf.nn.top_k(probs, k=tf.shape(probs)[1])
+            cumsum = tf.cumsum(sorted_p, axis=1)
+            cutoff = cumsum >= self._emb_top_p
+            scatter_mask = tf.scatter_nd(
+                tf.expand_dims(sorted_idx, -1),
+                tf.cast(cutoff, final_logits.dtype),
+                tf.shape(final_logits)
+            )
+            final_logits = tf.where(scatter_mask>0, final_logits, LOGIT_FILTER_VALUE)
 
         if self._emb_temp is not None:
-            logits /= self._emb_temp
+            final_logits = final_logits / self._emb_temp
 
         if self._softmax_in_log_space:
-            embeddings = logits.log_softmax(dim=1)
+            embeddings = tf.nn.log_softmax(final_logits, axis=1)
         else:
-            embeddings = (logits.log_softmax(dim=1).exp() + 1e-9).log()
-        zeros = torch.zeros(
-            (B, self.num_zeros_to_add),
-            dtype=embeddings.dtype,
-            device=embeddings.device,
-        )
-        return torch.cat((embeddings, zeros), dim=1)
+            embeddings = tf.math.log(tf.nn.softmax(final_logits, axis=1) + 1e-9)
+
+        zeros = tf.zeros([tf.shape(embeddings)[0], self.num_zeros_to_add], dtype=embeddings.dtype)
+        return tf.concat([embeddings, zeros], axis=1)
 
     def generate(
         self,
-        inputs: Dict[str, torch.Tensor],
-        generation_kwargs: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        generation_kwargs = copy.copy(generation_kwargs)  # make a copy so we can edit
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, Any],
+    ) -> tf.Tensor:
         inputs_embeds, attention_mask = self.embed_and_project(
             input_ids=inputs.get("input_ids"),
             attention_mask=inputs.get("attention_mask"),
             frozen_embeddings=inputs.get("frozen_embeddings"),
         )
+        return self.encoder_decoder.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **generation_kwargs,
+        )
 
-        if "decoder_input_ids" in inputs:
-            return self.encoder_decoder.generate(
-                # required: input embeddings
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                # optional: input IDs (for starting generation).
-                # typically not set unless generating prefixes for
-                # reranking.
-                decoder_input_ids=inputs["decoder_input_ids"],
-                # decoder_attention_mask=inputs["decoder_attention_mask"],
-                **generation_kwargs,
-            )
-        else:
-            return self.encoder_decoder.generate(
-                # required: input embeddings
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                # optional: input IDs (for starting generation).
-                # typically not set unless generating prefixes for
-                # reranking.
-                **generation_kwargs,
-            )
-
-    def forward(
+    def call(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        frozen_embeddings: Optional[torch.Tensor] = None,
-        decoder_input_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
+        input_ids: tf.Tensor,
+        attention_mask: tf.Tensor,
+        labels: Optional[tf.Tensor] = None,
+        decoder_input_ids: Optional[tf.Tensor] = None,
+        training=False,
         **kwargs,
-    ) -> Dict[str, torch.Tensor]:
-        # Unused: input_ids, attention_mask
-
-        inputs_embeds, attention_mask = self.embed_and_project(
+    ) -> transformers.modeling_tf_outputs.TFSeq2SeqLMOutput:
+        inputs_embeds, attn = self.embed_and_project(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            frozen_embeddings=frozen_embeddings,
+            frozen_embeddings=kwargs.get("frozen_embeddings"),
         )
         return self.encoder_decoder(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
+            attention_mask=attn,
             decoder_input_ids=decoder_input_ids,
-            past_key_values=past_key_values,
+            labels=labels,
+            training=training,
         )

@@ -1,8 +1,7 @@
 import os
 from typing import Any, Dict
 
-import torch
-import torch.nn as nn
+import tensorflow as tf
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -35,218 +34,311 @@ EMBEDDING_TRANSFORM_STRATEGIES = ["repeat"]
 
 
 def get_device():
-    """
-    Function that checks
-    for GPU availability and returns
-    the appropriate device.
-    :return: torch.device
-    """
-    if torch.cuda.is_available():
-        dev = "cuda"
-    elif torch.backends.mps.is_available():
-        dev = "mps"
+    if tf.config.list_physical_devices('GPU'):
+        dev = "GPU"
     else:
-        dev = "cpu"
-    device = torch.device(dev)
-    return device
+        dev = "CPU"
+    return dev
 
 
 device = get_device()
 
 
-def disable_dropout(model: nn.Module):
-    dropout_modules = [m for m in model.modules() if isinstance(m, nn.Dropout)]
-    for m in dropout_modules:
-        m.p = 0.0
-    print(
-        f"Disabled {len(dropout_modules)} dropout modules from model type {type(model)}"
-    )
+def disable_dropout(model):
+    dropout_count = 0
+    
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.Dropout):
+            layer.rate = 0.0
+            dropout_count += 1
+        
+        if hasattr(layer, 'layers'):
+            for sublayer in layer.layers:
+                if isinstance(sublayer, tf.keras.layers.Dropout):
+                    sublayer.rate = 0.0
+                    dropout_count += 1
+    
+    print(f"Disabled {dropout_count} dropout modules from model type {type(model)}")
 
 
-def freeze_params(model: nn.Module):
+def freeze_params(model):
     total_num_params = 0
-    for name, params in model.named_parameters():
-        params.requires_grad = False
-        total_num_params += params.numel()
-    # print(f"Froze {total_num_params} params from model type {type(model)}")
+    
+    for layer in model.layers:
+        layer.trainable = False
+        total_num_params += sum([tf.keras.backend.count_params(w) for w in layer.weights])
 
 
-def mean_pool(
-    hidden_states: torch.Tensor, attention_mask: torch.Tensor
-) -> torch.Tensor:
-    B, S, D = hidden_states.shape
-    unmasked_outputs = hidden_states * attention_mask[..., None]
-    pooled_outputs = unmasked_outputs.sum(dim=1) / attention_mask.sum(dim=1)[:, None]
-    assert pooled_outputs.shape == (B, D)
-    return pooled_outputs
+def mean_pool(hidden_states, attention_mask):
+    B = tf.shape(hidden_states)[0]
+    D = tf.shape(hidden_states)[2]
+    
+    attention_mask = tf.cast(attention_mask, dtype=hidden_states.dtype)
+    attention_mask = tf.expand_dims(attention_mask, axis=-1)
+    
+    unmasked_outputs = hidden_states * attention_mask
+    sum_embeddings = tf.reduce_sum(unmasked_outputs, axis=1)
+    sum_mask = tf.reduce_sum(attention_mask, axis=1) + 1e-9
+    
+    pooled_outputs = sum_embeddings / sum_mask
+    
+    assert_op = tf.debugging.assert_equal(
+        tf.shape(pooled_outputs)[:2],
+        [B, D]
+    )
+    
+    with tf.control_dependencies([assert_op]):
+        return pooled_outputs
 
 
-def max_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    B, S, D = hidden_states.shape
-    unmasked_outputs = hidden_states * attention_mask[..., None]
-    pooled_outputs = unmasked_outputs.max(dim=1).values
-    assert pooled_outputs.shape == (B, D)
-    return pooled_outputs
+def max_pool(hidden_states, attention_mask):
+    B = tf.shape(hidden_states)[0]
+    D = tf.shape(hidden_states)[2]
+    
+    attention_mask = tf.cast(attention_mask, dtype=hidden_states.dtype)
+    mask_expanded = tf.expand_dims(attention_mask, axis=-1)
+    
+    masked_hidden_states = hidden_states * mask_expanded + (1 - mask_expanded) * -1e9
+    
+    pooled_outputs = tf.reduce_max(masked_hidden_states, axis=1)
+    
+    assert_op = tf.debugging.assert_equal(
+        tf.shape(pooled_outputs)[:2],
+        [B, D]
+    )
+    
+    with tf.control_dependencies([assert_op]):
+        return pooled_outputs
 
 
-def stack_pool(
-    hidden_states: torch.Tensor, attention_mask: torch.Tensor
-) -> torch.Tensor:
-    B, S, D = hidden_states.shape
-    unmasked_outputs = hidden_states * attention_mask[..., None]
-    pooled_outputs = unmasked_outputs.reshape((B, S * D))  # stack along seq length
-    assert pooled_outputs.shape == (B, S * D)
-    return pooled_outputs
+def stack_pool(hidden_states, attention_mask):
+    B = tf.shape(hidden_states)[0]
+    S = tf.shape(hidden_states)[1]
+    D = tf.shape(hidden_states)[2]
+    
+    attention_mask = tf.cast(attention_mask, dtype=hidden_states.dtype)
+    mask_expanded = tf.expand_dims(attention_mask, axis=-1)
+    unmasked_outputs = hidden_states * mask_expanded
+    
+    pooled_outputs = tf.reshape(unmasked_outputs, [B, S * D])
+    
+    assert_op = tf.debugging.assert_equal(
+        tf.shape(pooled_outputs)[:2],
+        [B, S * D]
+    )
+    
+    with tf.control_dependencies([assert_op]):
+        return pooled_outputs
 
 
-def load_embedder_and_tokenizer(name: str, torch_dtype: str, **kwargs):
-    # TODO make abstract/argparse for it etc.
-    # name = "gpt2" #### <--- TEMP. For debugging. Delete!
+def load_embedder_and_tokenizer(name, tf_dtype=None, **kwargs):
     model_kwargs = {
-        "low_cpu_mem_usage": True,  # Not compatible with DeepSpeed
         "output_hidden_states": False,
     }
-
+    
     if name == "dpr":
-        # model = SentenceTransformer("sentence-transformers/facebook-dpr-question_encoder-multiset-base")
-        model = transformers.DPRContextEncoder.from_pretrained(
-            "facebook/dpr-ctx_encoder-single-nq-base"
-        )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             "facebook/dpr-ctx_encoder-single-nq-base"
         )
+        try:
+            model = transformers.TFDPRContextEncoder.from_pretrained(
+                "facebook/dpr-ctx_encoder-single-nq-base", from_pt=True
+            )
+        except:
+            model = transformers.TFDPRContextEncoder.from_pretrained(
+                "facebook/dpr-ctx_encoder-single-nq-base", from_pt=True
+            )
     elif name == "dpr_st":
-        # TODO figure out why model w/ sentence transformers gives different results.
-        model = SentenceTransformer(
+        st_model = SentenceTransformer(
             "sentence-transformers/facebook-dpr-question_encoder-multiset-base"
         )
-        tokenizer = model.tokenizer
+        tokenizer = st_model.tokenizer
+        model = st_model
     elif name == "contriever":
-        model = transformers.AutoModel.from_pretrained(
-            "facebook/contriever", **model_kwargs
-        )
         tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/contriever")
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                "facebook/contriever", **model_kwargs
+            )
+        except:
+            model = transformers.TFAutoModel.from_pretrained(
+                "facebook/contriever", from_pt=True, **model_kwargs
+            )
     elif name == "bert":
-        model = transformers.AutoModel.from_pretrained(
+        tokenizer = transformers.AutoTokenizer.from_pretrained("bert-base-uncased")
+        model = transformers.TFAutoModel.from_pretrained(
             "bert-base-uncased", **model_kwargs
         )
-        tokenizer = transformers.AutoTokenizer.from_pretrained("bert-base-uncased")
     elif name == "gtr_base":
-        model = transformers.AutoModel.from_pretrained(
-            "sentence-transformers/gtr-t5-base", **model_kwargs
-        ).encoder
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             "sentence-transformers/gtr-t5-base"
         )
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                "sentence-transformers/gtr-t5-base", **model_kwargs
+            ).encoder
+        except:
+            model = transformers.TFAutoModel.from_pretrained(
+                "sentence-transformers/gtr-t5-base", from_pt=True, **model_kwargs
+            ).encoder
     elif name == "gtr_base__random_init":
         config = transformers.AutoConfig.from_pretrained(
             "sentence-transformers/gtr-t5-base"
         )
-        model = transformers.AutoModel.from_config(config).encoder
+        model = transformers.TFAutoModel.from_pretrained(
+            "sentence-transformers/gtr-t5-base", from_pt=True, **model_kwargs
+        ).encoder
+        for layer in model.layers:
+            if hasattr(layer, 'kernel'):
+                layer.kernel.assign(
+                    tf.keras.initializers.GlorotUniform()(shape=layer.kernel.shape)
+                )
+            if hasattr(layer, 'bias') and layer.bias is not None:
+                layer.bias.assign(tf.zeros_like(layer.bias))
+                
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             "sentence-transformers/gtr-t5-base"
         )
-    elif name == "gtr_base_st":
-        model = SentenceTransformer("sentence-transformers/gtr-t5-base")
-        tokenizer = model.tokenizer
-    elif name == "gtr_large":
-        model = SentenceTransformer("sentence-transformers/gtr-t5-large")
-        tokenizer = model.tokenizer
+    elif name == "gtr_base_st" or name == "gtr_large":
+        st_name = "sentence-transformers/gtr-t5-base" if name == "gtr_base_st" else "sentence-transformers/gtr-t5-large"
+        st_model = SentenceTransformer(st_name)
+        tokenizer = st_model.tokenizer
+        model = st_model
     elif name == "ance_tele":
-        model = transformers.AutoModel.from_pretrained(
-            "OpenMatch/ance-tele_nq_psg-encoder", **model_kwargs
-        )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             "OpenMatch/ance-tele_nq_psg-encoder"
         )
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                "OpenMatch/ance-tele_nq_psg-encoder", **model_kwargs
+            )
+        except:
+            model = transformers.TFAutoModel.from_pretrained(
+                "OpenMatch/ance-tele_nq_psg-encoder", from_pt=True, **model_kwargs
+            )
     elif name == "paraphrase-distilroberta":
-        model = transformers.AutoModel.from_pretrained(
-            "sentence-transformers/paraphrase-distilroberta-base-v1", **model_kwargs
-        )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             "sentence-transformers/paraphrase-distilroberta-base-v1"
         )
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                "sentence-transformers/paraphrase-distilroberta-base-v1", **model_kwargs
+            )
+        except:
+            model = transformers.TFAutoModel.from_pretrained(
+                "sentence-transformers/paraphrase-distilroberta-base-v1", 
+                from_pt=True, 
+                **model_kwargs
+            )
     elif name == "medicalai/ClinicalBERT":
-        model = transformers.AutoModel.from_pretrained(
-            "medicalai/ClinicalBERT", **model_kwargs
-        )
         tokenizer = transformers.AutoTokenizer.from_pretrained("medicalai/ClinicalBERT")
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                "medicalai/ClinicalBERT", **model_kwargs
+            )
+        except:
+            model = transformers.TFAutoModel.from_pretrained(
+                "medicalai/ClinicalBERT", from_pt=True, **model_kwargs
+            )
     elif name.startswith("gpt2"):
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            name,
-            **model_kwargs,
-        )
-        # model.to_bettertransformer()
         tokenizer = transformers.AutoTokenizer.from_pretrained(name)
         tokenizer.pad_token = tokenizer.eos_token
+        try:
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name, **model_kwargs
+            )
+        except:
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name, from_pt=True, **model_kwargs
+            )
     elif name.startswith("meta-llama/Llama-2-70b"):
-        bnb_config = transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        model_config = transformers.AutoConfig.from_pretrained(
-            name,
-        )
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            name,
-            trust_remote_code=True,
-            config=model_config,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        tokenizer = transformers.AutoTokenizer.from_pretrained(name)
-        model.eval()
-    elif name.startswith("meta-llama/"):
-        if torch_dtype == "float32":
-            torch_dtype = torch.float32
-        elif torch_dtype == "float16":
-            torch_dtype = torch.float16
-        elif torch_dtype == "bfloat16":
-            torch_dtype = torch.bfloat16
-        model = transformers.AutoModelForCausalLM.from_pretrained(
-            name,
-            **model_kwargs,
-            token=os.environ.get("LLAMA_TOKEN"),
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
-        # if torch_dtype is not torch.float32:
-        #     model.to_bettertransformer()
         tokenizer = transformers.AutoTokenizer.from_pretrained(name)
         tokenizer.pad_token = tokenizer.eos_token
+        
+        try:
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name, from_pt=True, **model_kwargs
+            )
+        except:
+            print("Warning: 70B model may not work well in TensorFlow")
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name, from_pt=True, **model_kwargs
+            )
+            
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    elif name.startswith("meta-llama/"):
+        tokenizer = transformers.AutoTokenizer.from_pretrained(name)
+        tokenizer.pad_token = tokenizer.eos_token
+        
+        if tf_dtype == "float32":
+            tf_dtype = tf.float32
+        elif tf_dtype == "float16":
+            tf_dtype = tf.float16
+        elif tf_dtype == "bfloat16":
+            tf_dtype = tf.bfloat16
+            
+        try:
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name,
+                **model_kwargs,
+                token=os.environ.get("LLAMA_TOKEN"),
+                from_pt=True,
+                **kwargs,
+            )
+        except:
+            print(f"Error loading LLaMA model {name}")
+            model = transformers.TFAutoModelForCausalLM.from_pretrained(
+                name, from_pt=True, **model_kwargs
+            )
+            
+        if tf_dtype is not None:
+            tf.keras.mixed_precision.set_global_policy(tf_dtype.name)
     elif name.startswith("sentence-transformers/"):
-        model = SentenceTransformer(name)
-        tokenizer = model.tokenizer
+        st_model = SentenceTransformer(name)
+        tokenizer = st_model.tokenizer
+        model = st_model
     else:
         print(f"WARNING: Trying to initialize from unknown embedder {name}")
-        model = transformers.AutoModel.from_pretrained(name, **model_kwargs)
         tokenizer = transformers.AutoTokenizer.from_pretrained(name)
-
-    # model = torch.compile(model)
+        try:
+            model = transformers.TFAutoModel.from_pretrained(
+                name, **model_kwargs
+            )
+        except:
+            print(f"No native TF model found for {name}, trying PyTorch conversion")
+            model = transformers.TFAutoModel.from_pretrained(
+                name, from_pt=True, **model_kwargs
+            )
+            
+    if not isinstance(model, SentenceTransformer):
+        try:
+            model.compile(optimizer='adam')
+        except:
+            pass
+        
     return model, tokenizer
 
 
-def load_encoder_decoder(
-    model_name: str, lora: bool = False
-) -> transformers.AutoModelForSeq2SeqLM:
-    model_kwargs: Dict[str, Any] = {
-        "low_cpu_mem_usage": True,
-    }
+def load_encoder_decoder(model_name, lora=False):
+    model_kwargs = {}
+    
     if lora:
-        model_kwargs.update(
-            {
-                "load_in_8bit": True,
-                "device_map": "auto",
-            }
+        print("Warning: LoRA not directly supported in TensorFlow")
+        
+    try:
+        model = transformers.TFAutoModelForSeq2SeqLM.from_pretrained(
+            model_name, **model_kwargs
         )
-    return transformers.AutoModelForSeq2SeqLM.from_pretrained(
-        model_name, **model_kwargs
-    )
+    except:
+        print(f"No native TF model found for {model_name}, trying PyTorch conversion")
+        model = transformers.TFAutoModelForSeq2SeqLM.from_pretrained(
+            model_name, from_pt=True, **model_kwargs
+        )
+        
+    return model
 
 
-def load_tokenizer(name: str, max_length: int) -> transformers.PreTrainedTokenizer:
+def load_tokenizer(name, max_length):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         name,
         padding="max_length",
@@ -257,7 +349,5 @@ def load_tokenizer(name: str, max_length: int) -> transformers.PreTrainedTokeniz
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Disable super annoying warning:
-    # https://github.com/huggingface/transformers/issues/22638
     tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
     return tokenizer
