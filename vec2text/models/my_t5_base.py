@@ -4,7 +4,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from transformers import TFT5ForConditionalGeneration, T5Tokenizer
-from transformers.modeling_outputs import BaseModelOutput
+from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 
 
 class T5SparseEncoderTF(TFT5ForConditionalGeneration):
@@ -51,7 +51,7 @@ class T5SparseEncoderTF(TFT5ForConditionalGeneration):
         attentions = None
         if output_attentions:
             attentions = encoder_outputs.attentions
-        return TFBaseModelOutput(
+        return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=None,
             attentions=attentions
@@ -66,7 +66,7 @@ class T5SparseEncoderTF(TFT5ForConditionalGeneration):
         head_mask: Optional[tf.Tensor] = None,
         decoder_head_mask: Optional[tf.Tensor] = None,
         cross_attn_head_mask: Optional[tf.Tensor] = None,
-        encoder_outputs: Optional[TFBaseModelOutput] = None,
+        encoder_outputs: Optional[BaseModelOutput] = None,
         past_key_values: Optional[Tuple[tf.Tensor]] = None,
         inputs_embeds: Optional[tf.Tensor] = None,
         decoder_inputs_embeds: Optional[tf.Tensor] = None,
@@ -76,7 +76,7 @@ class T5SparseEncoderTF(TFT5ForConditionalGeneration):
         return_dict: Optional[bool] = None,
         labels: Optional[tf.Tensor] = None,
         **kwargs
-    ) -> Union[Tuple[tf.Tensor], TFSeq2SeqLMOutput]:
+    ) -> Union[Tuple[tf.Tensor], Seq2SeqLMOutput]:
         r"""
         Returns:
 
@@ -138,7 +138,7 @@ git b
         if not return_dict:
             output = (lm_logits,) + decoder_outputs[1:] + (encoder_outputs,)
             return ((loss,) + output) if loss is not None else output
-        return TFSeq2SeqLMOutput(
+        return Seq2SeqLMOutput(
             loss=loss,
             logits=lm_logits,
             past_key_values=decoder_outputs.past_key_values,
