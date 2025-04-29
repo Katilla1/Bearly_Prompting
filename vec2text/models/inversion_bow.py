@@ -1,7 +1,6 @@
 from typing import Dict, Optional
 
-import torch
-import torch.nn as nn
+import tensorflow as tf
 import transformers
 
 from vec2text.models.config import InversionConfig
@@ -12,19 +11,14 @@ from vec2text.models.model_utils import (
 )
 
 
-class InversionModelBagOfWords(transformers.PreTrainedModel):
-    embedder: torch.nn.Module
-    encoder: transformers.AutoModel
-    tokenizer: transformers.AutoTokenizer
-    embedder_tokenizer: transformers.AutoTokenizer
-
+class InversionModelBagOfWords(transformers.TFPreTrainedModel):
     def __init__(self, config: InversionConfig):
         super().__init__(config=config)
 
         embedder, embedder_tokenizer = load_embedder_and_tokenizer(
             name=config.embedder_model_name, torch_dtype=config.embedder_torch_dtype
         )
-        encoder = transformers.AutoModel.from_pretrained(
+        encoder = transformers.TFAutoModel.from_pretrained(
             config.model_name_or_path,
         ).encoder
         tokenizer = load_tokenizer(
@@ -36,16 +30,16 @@ class InversionModelBagOfWords(transformers.PreTrainedModel):
         self.encoder = encoder
         self.embedder_tokenizer = embedder_tokenizer
         self.tokenizer = tokenizer
-        self.lm_transform = nn.Sequential(
-            nn.Linear(self.d_encoder, self.d_encoder),
-            nn.GELU(),
-            nn.LayerNorm(self.d_encoder),
-        )
-        self.in_projection = torch.nn.Sequential(
-            torch.nn.Linear(self.d_embedder, self.d_encoder),
-            torch.nn.GELU(),
-            torch.nn.Linear(self.d_encoder, self.d_encoder),
-        )
+        self.lm_transform = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.d_encoder),
+            tf.keras.layers.Activation('gelu'),
+            tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        ])
+        self.in_projection = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.d_encoder),
+            tf.keras.layers.Activation('gelu'),
+            tf.keras.layers.Dense(self.d_encoder)
+        ])
 
     @property
     def d_encoder(self) -> int:
@@ -57,103 +51,102 @@ class InversionModelBagOfWords(transformers.PreTrainedModel):
 
     def generate(
         self,
-        inputs: Dict[str, torch.Tensor],
-        generation_kwargs: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        # TODO respect generation kwargs.
-        with torch.no_grad():
-            logits = self.forward(**inputs)["logits"]
-        # TODO implement different generation strategies
-
-        max_length = inputs.get("input_ids", inputs["embedder_input_ids"]).shape[1]
-        # Take top `seq_length` tokens
-        return logits.topk(max_length, dim=1).indices
+        inputs: Dict[str, tf.Tensor],
+        generation_kwargs: Dict[str, tf.Tensor],
+    ) -> tf.Tensor:
+        logits = self.call(**inputs)["logits"]
+        max_length = tf.shape(inputs.get("input_ids", inputs["embedder_input_ids"]))[1]
+        return tf.math.top_k(logits, k=max_length).indices
 
     def call_embedding_model(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        input_ids: tf.Tensor,
+        attention_mask: tf.Tensor,
+    ) -> tf.Tensor:
         outputs = self.embedder(input_ids=input_ids, attention_mask=attention_mask)
         hidden_state = outputs.last_hidden_state
         return mean_pool(hidden_state, attention_mask)
 
     def bow_logits(
-        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+        self, inputs_embeds: tf.Tensor, attention_mask: tf.Tensor
+    ) -> tf.Tensor:
         outputs = self.encoder(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
-        # Drop the first token, which is the sentence embedding input.
-        # tokens = outputs.last_hidden_state[:, 1:, :]
-        # Project
         output_vector = mean_pool(outputs.last_hidden_state, attention_mask)
         projected = self.lm_transform(output_vector)
-        word_embeddings = self.encoder.get_input_embeddings().weight
-        # Multiply by vocab
-        logits = projected @ word_embeddings.T
+        word_embeddings = self.encoder.get_input_embeddings().weights[0]
+        logits = tf.matmul(projected, word_embeddings, transpose_b=True)
         return logits
 
     def bow_loss(
         self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> torch.Tensor:
-        vocab_size = self.encoder.get_input_embeddings().weight.shape[0]
-        vocab = torch.arange(vocab_size, dtype=labels.dtype, device=labels.device)
-        one_hot_labels = (labels[:, :, None] == vocab[None, :]).any(dim=1).float()
-        return torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, one_hot_labels
+        logits: tf.Tensor,
+        labels: tf.Tensor,
+    ) -> tf.Tensor:
+        vocab_size = tf.shape(self.encoder.get_input_embeddings().weights[0])[0]
+        vocab = tf.range(vocab_size, dtype=labels.dtype)
+        
+        expanded_labels = tf.expand_dims(labels, axis=-1)
+        expanded_vocab = tf.expand_dims(tf.expand_dims(vocab, 0), 0)
+        
+        mask = tf.equal(expanded_labels, expanded_vocab)
+        one_hot_labels = tf.cast(tf.reduce_any(mask, axis=1), tf.float32)
+        
+        return tf.reduce_mean(
+            tf.keras.losses.binary_crossentropy(
+                one_hot_labels, logits, from_logits=True
+            )
         )
 
-    def forward(
+    def call(
         self,
-        embedder_input_ids: torch.Tensor,
-        embedder_attention_mask: torch.Tensor,
-        labels: torch.Tensor = None,
-        frozen_embeddings: Optional[torch.Tensor] = None,
+        embedder_input_ids: tf.Tensor,
+        embedder_attention_mask: tf.Tensor,
+        labels: tf.Tensor = None,
+        frozen_embeddings: Optional[tf.Tensor] = None,
+        training: bool = False,
         **kwargs,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size, seq_length = embedder_input_ids.shape
+    ) -> Dict[str, tf.Tensor]:
+        batch_size = tf.shape(embedder_input_ids)[0]
+        seq_length = tf.shape(embedder_input_ids)[1]
+        
         if frozen_embeddings is None:
-            with torch.no_grad():
-                embedding = self.call_embedding_model(
-                    input_ids=embedder_input_ids, attention_mask=embedder_attention_mask
+            embedding = tf.stop_gradient(
+                self.call_embedding_model(
+                    input_ids=embedder_input_ids, 
+                    attention_mask=embedder_attention_mask
                 )
+            )
         else:
             embedding = frozen_embeddings
-        assert embedding.shape == (batch_size, self.d_embedder)
+            
+        tf.debugging.assert_equal(tf.shape(embedding), (batch_size, self.d_embedder))
         embedding = self.in_projection(embedding)
-        # TODO: check that it's ok if we make every token '<unk>'.
-        input_ids = self.tokenizer.unk_token_id * torch.ones_like(
-            embedder_input_ids, device=embedder_input_ids.device
-        )
+        
+        input_ids = tf.ones_like(embedder_input_ids) * self.tokenizer.unk_token_id
         inputs_embeds = self.encoder.embed_tokens(input_ids)
-        # TODO: support & ablate concatenation methods.
-        inputs_embeds = torch.cat((embedding[:, None, :], inputs_embeds), dim=1)
-        attention_mask = torch.ones(
-            inputs_embeds.shape[0:2], device=inputs_embeds.device
-        )
+        
+        embedding = tf.expand_dims(embedding, axis=1)
+        inputs_embeds = tf.concat([embedding, inputs_embeds], axis=1)
+        
+        attention_mask = tf.ones(tf.shape(inputs_embeds)[:2])
+        
         logits = self.bow_logits(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
-        outputs = {"logits": logits}  # hf trainer output format
+        
+        outputs = {"logits": logits}
+        
         if labels is not None:
-            labels = torch.cat(
-                (
-                    -100
-                    * torch.ones(
-                        (batch_size, 1), dtype=labels.dtype, device=labels.device
-                    ),
-                    labels,
-                ),
-                dim=1,
-            )
+            padding = -100 * tf.ones((batch_size, 1), dtype=labels.dtype)
+            labels = tf.concat([padding, labels], axis=1)
             loss = self.bow_loss(
                 logits=logits,
                 labels=labels,
             )
             outputs["loss"] = loss
+            
         return outputs
