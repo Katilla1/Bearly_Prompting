@@ -46,8 +46,8 @@ def train(dataset_path):
         config_dict = json.load(f)
     config_dict['use_wandb'] = False
     config_dict['report_to'] = []
-    config_dict['per_device_train_batch_size'] = 8
-    config_dict['per_device_eval_batch_size'] = 8
+    config_dict['per_device_train_batch_size'] = 1
+    config_dict['per_device_eval_batch_size'] = 1
     config_dict['gradient_accumulation_steps'] = 1
     config_dict['eval_steps'] = 500
     config_dict['experiment'] = 'inversion_from_output_sparse'
@@ -66,6 +66,7 @@ def train(dataset_path):
     model.mode = mode
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
     train_ds = load_from_disk(dataset_path)
+    train_ds = train_ds.select(range(25))
     trainer = Prompt2OutputTrainer(
         model=model,
         args=experiment.training_args,
