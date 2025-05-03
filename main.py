@@ -67,8 +67,8 @@ def train(dataset_path, framework='pytorch'):
         config_dict = json.load(f)
     config_dict['use_wandb'] = False
     config_dict['report_to'] = []
-    config_dict['per_device_train_batch_size'] = 5
-    config_dict['per_device_eval_batch_size'] = 5
+    config_dict['per_device_train_batch_size'] = 8
+    config_dict['per_device_eval_batch_size'] = 8
     config_dict['gradient_accumulation_steps'] = 1
     config_dict['eval_steps'] = 500
     config_dict['evaluation_strategy'] = 'no'
@@ -86,7 +86,8 @@ def train(dataset_path, framework='pytorch'):
     
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
     train_ds = load_from_disk(dataset_path)
-    train_ds = train_ds.select(range(2500))
+    #Use to train on subset of dataset
+    #train_ds = train_ds.select(range(?))
     
     if framework == 'pytorch':
         model = T5SparseEncoder.from_pretrained('t5-base')
@@ -141,7 +142,8 @@ def test(model_path, dataset_path, framework='pytorch'):
     
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
     eval_ds = load_from_disk(dataset_path)
-    #eval_ds = eval_ds.select(range(25))
+    #Use to test on subset of dataset
+    #eval_ds = eval_ds.select(range(?))
 
     if framework == 'pytorch':
         model = T5SparseEncoder.from_pretrained('t5-base')
