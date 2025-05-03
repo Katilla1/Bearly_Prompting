@@ -1,13 +1,18 @@
 from vec2text import experiments, analyze_utils
 from vec2text.models.my_t5_base import T5SparseEncoder
+from vec2text.models.my_t5_base_tf import TFT5SparseEncoder
 from vec2text.models.config import InversionConfig
 from datasets import load_dataset, load_from_disk
 import torch, json, random, sys
+import tensorflow as tf
 from transformers import Trainer, T5Tokenizer, GenerationConfig
 from vec2text.trainers.base import BaseTrainer
+from vec2text.trainers.base_tf import TFBaseTrainer
 from typing import Dict
 from transformers.generation.stopping_criteria import StoppingCriteriaList, MaxLengthCriteria
 from datasets import Dataset
+from transformers import AutoModelForCausalLM
+import torch.nn as nn
 
 class Prompt2OutputCollator:
     def __call__(self, features, return_tensors=None):
@@ -25,31 +30,48 @@ class Prompt2OutputCollator:
                 result_list = result_list[:32]
             else:
                 result_list = feature['result_list']
-            input_ids.append(torch.tensor(result_list))
-            labels.append(torch.tensor(feature['system_prompt']))
+            input_ids.append(result_list)
+            labels.append(feature['system_prompt'])
             names.append(feature['names'])
             questions.append(feature['questions'])
+        
+        # Convert to tensors
+        if return_tensors == 'pt':
+            input_ids = torch.tensor(input_ids)
+            labels = torch.tensor(labels)
+        elif return_tensors == 'tf':
+            input_ids = tf.convert_to_tensor(input_ids)
+            labels = tf.convert_to_tensor(labels)
+        else:
+            # Default to PyTorch tensors for backward compatibility
+            input_ids = torch.tensor(input_ids)
+            labels = torch.tensor(labels)
+        
         return {
-            'input_ids': torch.stack(input_ids),
-            'labels': torch.stack(labels),
+            'input_ids': input_ids,
+            'labels': labels,
             'names': names,
             'questions': questions
         }
-    
 
 class Prompt2OutputTrainer(BaseTrainer):
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs['input_ids'], generation_config=GenerationConfig(**generation_kwargs))
 
-def train(dataset_path):
+class TFPrompt2OutputTrainer(TFBaseTrainer):
+    def generate(self, inputs: Dict, generation_kwargs: Dict):
+        return self.model.generate(inputs=inputs['input_ids'], generation_config=GenerationConfig(**generation_kwargs))
+
+def train(dataset_path, framework='pytorch'):
     with open('prompt2output/config.json') as f:
         config_dict = json.load(f)
     config_dict['use_wandb'] = False
     config_dict['report_to'] = []
-    config_dict['per_device_train_batch_size'] = 1
-    config_dict['per_device_eval_batch_size'] = 1
+    config_dict['per_device_train_batch_size'] = 5
+    config_dict['per_device_eval_batch_size'] = 5
     config_dict['gradient_accumulation_steps'] = 1
     config_dict['eval_steps'] = 500
+    config_dict['evaluation_strategy'] = 'no'
     config_dict['experiment'] = 'inversion_from_output_sparse'
     config_dict["num_train_epochs"] = 1
     config_dict["warmup_steps"] = 0
@@ -61,25 +83,42 @@ def train(dataset_path):
         name, config=config, use_less_data = -1
     )
     experiment.exp_name = name
-    model = T5SparseEncoder.from_pretrained('t5-base')
-    model.config.max_seq_length = 1024
-    model.mode = mode
+    
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
     train_ds = load_from_disk(dataset_path)
-    train_ds = train_ds.select(range(25))
-    trainer = Prompt2OutputTrainer(
-        model=model,
-        args=experiment.training_args,
-        train_dataset=train_ds,
-        eval_dataset=None,
-        data_collator=Prompt2OutputCollator(),
-    )
+    train_ds = train_ds.select(range(2500))
+    
+    if framework == 'pytorch':
+        model = T5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = Prompt2OutputTrainer(
+            model=model,
+            args=experiment.training_args,
+            train_dataset=train_ds,
+            eval_dataset=None,
+            data_collator=Prompt2OutputCollator(),
+        )
+    else:
+        model = TFT5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = TFPrompt2OutputTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            embedder_tokenizer=tokenizer,
+            training_args=experiment.training_args,
+            train_dataset=train_ds,
+            eval_dataset=None,
+            data_collator=Prompt2OutputCollator(),
+        )
+    
     trainer.tokenizer = tokenizer
     trainer.embedder_tokenizer = tokenizer
     trainer.args.metric_for_best_model = None
     trainer.train()
 
-def test(model_path, dataset_path):
+def test(model_path, dataset_path, framework='pytorch'):
     with open('prompt2output/config.json') as f:
         config_dict = json.load(f)
     config_dict['use_wandb'] = False
@@ -99,25 +138,43 @@ def test(model_path, dataset_path):
         name, config=config, use_less_data = -1
     )
     experiment.exp_name = name
-    model = T5SparseEncoder.from_pretrained('t5-base')
-    model.config.max_seq_length = 1024
-    model.mode = mode
+    
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
     eval_ds = load_from_disk(dataset_path)
-    trainer = Prompt2OutputTrainer(
-        model=model,
-        args=experiment.training_args,
-        train_dataset=None,
-        eval_dataset=eval_ds,
-        data_collator=Prompt2OutputCollator(),
-    )
+    #eval_ds = eval_ds.select(range(25))
+
+    if framework == 'pytorch':
+        model = T5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = Prompt2OutputTrainer(
+            model=model,
+            args=experiment.training_args,
+            train_dataset=None,
+            eval_dataset=eval_ds,
+            data_collator=Prompt2OutputCollator(),
+        )
+    else:
+        model = TFT5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = TFPrompt2OutputTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            embedder_tokenizer=tokenizer,
+            training_args=experiment.training_args,
+            train_dataset=None,
+            eval_dataset=eval_ds,
+            data_collator=Prompt2OutputCollator(),
+        )
+    
     trainer.tokenizer = tokenizer
     trainer.embedder_tokenizer = tokenizer
     trainer.args.metric_for_best_model = None
     trainer._load_from_checkpoint(model_path)
     trainer.evaluate()
 
-def test_sample(model_path, prompt_outputs):
+def test_sample(model_path, prompt_outputs, framework='pytorch'):
     with open('prompt2output/config.json') as f:
         config_dict = json.load(f)
     config_dict['use_wandb'] = False
@@ -137,22 +194,42 @@ def test_sample(model_path, prompt_outputs):
         name, config=config, use_less_data = -1
     )
     experiment.exp_name = name
-    model = T5SparseEncoder.from_pretrained('t5-base')
-    model.config.max_seq_length = 1024
-    model.mode = mode
+    
     tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained('t5-base')
-    trainer = Prompt2OutputTrainer(
-        model=model,
-        args=experiment.training_args,
-        train_dataset=None,
-        eval_dataset=None,
-        data_collator=Prompt2OutputCollator(),
-    )
+    
+    if framework == 'pytorch':
+        model = T5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = Prompt2OutputTrainer(
+            model=model,
+            args=experiment.training_args,
+            train_dataset=None,
+            eval_dataset=None,
+            data_collator=Prompt2OutputCollator(),
+        )
+        input_ids = tokenizer.batch_encode_plus(prompt_outputs, return_tensors='pt', padding=True, truncation=True, max_length=64)['input_ids'].unsqueeze(0).to('cuda')
+    else:
+        model = TFT5SparseEncoder.from_pretrained('t5-base')
+        model.config.max_seq_length = 1024
+        model.mode = mode
+        trainer = TFPrompt2OutputTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            embedder_tokenizer=tokenizer,
+            training_args=experiment.training_args,
+            train_dataset=None,
+            eval_dataset=None,
+            data_collator=Prompt2OutputCollator(),
+        )
+        input_ids = tokenizer.batch_encode_plus(prompt_outputs, return_tensors='tf', padding=True, truncation=True, max_length=64)['input_ids']
+        input_ids = tf.expand_dims(input_ids, 0)
+    
     trainer.tokenizer = tokenizer
     trainer.embedder_tokenizer = tokenizer
     trainer.args.metric_for_best_model = None
     trainer._load_from_checkpoint(model_path)
-    input_ids = tokenizer.batch_encode_plus(prompt_outputs, return_tensors='pt', padding=True, truncation=True, max_length=64)['input_ids'].unsqueeze(0).to('cuda')
+    
     print(input_ids)
     inputs = {
         'input_ids': input_ids
@@ -161,11 +238,10 @@ def test_sample(model_path, prompt_outputs):
     result = trainer.generate(inputs, generation_kwargs)
     print(tokenizer.decode(result[0]))
 
-
 dataset_dict = {
     'chat_instruction2m': ['datasets/train/chat_instruction2m', 'datasets/test/chat_instruction2m'],
     'lm_instruction2m': ['datasets/train/lm_instruction2m', 'datasets/test/lm_instruction2m'],
-    'sharegpt': [None, 'datasets/test/chat_sharegpt'],
+    'sharegpt': [None, 'datasets/test/chat_sharegpt_len64_num64_dataset'],
     'unnatural': [None, 'datasets/test/chat_unnatural'],
     'synthetic': ['datasets/train/synthetic_gpts', 'datasets/test/synthetic_gpts'],
     'real': [None, 'datasets/test/real_gpts_arrow'],
@@ -185,28 +261,28 @@ prompt_outputs = """1: I am Laundry Buddy, your expert in laundry care.
 6: My tips ensure your clothes look their best.
 7: I turn laundry challenges into simple tasks.
 8: I make laundry day a breeze with my expert advice.
-9: I’m here to keep your clothes fresh and clean.
+9: I'm here to keep your clothes fresh and clean.
 10: I provide easy-to-follow DO's and DON'Ts for laundry.
 11: My tone is cheerful and upbeat.
 12: I help you tackle tough stains with confidence.
 13: I know how to care for delicate fabrics.
 14: I can extend the life of your favorite garments.
 15: I make laundry care both effective and fun.
-16: I’m your go-to guide for all things laundry!
+16: I'm your go-to guide for all things laundry!
 How do I remove a red wine stain from a white shirt?
-What’s the best way to wash delicate fabrics like silk?
+What's the best way to wash delicate fabrics like silk?
 Can you explain the different washing machine settings and when to use them?
 How do I prevent my dark clothes from fading in the wash?
-What’s the best way to get rid of sweat stains on my clothes?
+What's the best way to get rid of sweat stains on my clothes?
 How should I wash my new jeans to prevent them from shrinking?
 Can I wash my sneakers in the washing machine?
-What’s the proper way to sort laundry before washing?
+What's the proper way to sort laundry before washing?
 How do I remove grease stains from my favorite t-shirt?
 Should I use fabric softener on towels?
-What’s the best method for drying clothes to avoid wrinkles?
+What's the best method for drying clothes to avoid wrinkles?
 How do I get rid of mildew smell from my clothes?
 Can I use bleach on colored clothes?
-What’s the best way to wash and dry bed linens?
+What's the best way to wash and dry bed linens?
 How do I remove pet hair from my laundry?
 Can you give tips on how to hand wash clothes properly?
 Removing Coffee Stains: Got a coffee spill on your favorite shirt? I can guide you on how to remove it effectively.
@@ -230,11 +306,11 @@ Travel Laundry Tips: Going on a trip and need laundry advice? I can offer tips f
 3: I offer tailored laundry solutions; ChatGPT offers diverse knowledge.
 4: I focus on machine settings and fabric care; ChatGPT can discuss anything from history to science.
 5: My expertise lies in sorting laundry; ChatGPT excels in answering wide-ranging questions.
-6: I’m great with laundry do’s and don’ts; ChatGPT provides a balanced perspective on many subjects.
+6: I'm great with laundry do's and don'ts; ChatGPT provides a balanced perspective on many subjects.
 7: I provide upbeat and cheerful laundry advice; ChatGPT adapts to various tones and styles.
-8: I’m here to ensure optimal cleaning results; ChatGPT ensures comprehensive responses.
+8: I'm here to ensure optimal cleaning results; ChatGPT ensures comprehensive responses.
 9: My knowledge is centered on laundry-related queries; ChatGPT spans countless topics.
-10: I’m customized for specific laundry tasks; ChatGPT is a generalist in AI assistance.
+10: I'm customized for specific laundry tasks; ChatGPT is a generalist in AI assistance.
 11: I specialize in fabric care solutions; ChatGPT can discuss complex theories.
 12: My tips make laundry easy and efficient; ChatGPT makes information accessible.
 13: I focus on practical laundry advice; ChatGPT focuses on informative dialogues.
@@ -242,14 +318,42 @@ Travel Laundry Tips: Going on a trip and need laundry advice? I can offer tips f
 15: I am the Laundry Buddy; ChatGPT is a versatile AI assistant.
 16: I help with laundry care; ChatGPT helps with everything else!""".split("\n")
 
+class Prompt2OutputModel(nn.Module):
+    def __init__(self, model_name, tokenizer, max_length=512):
+        super().__init__()
+        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def forward(self, input_ids, labels=None):
+        # Ensure input_ids is a tensor
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids)
+        
+        # Move to the same device as the model
+        input_ids = input_ids.to(self.model.device)
+        if labels is not None:
+            labels = labels.to(self.model.device)
+        
+        # Get model outputs
+        outputs = self.model(
+            input_ids=input_ids,
+            labels=labels,
+            return_dict=True
+        )
+        
+        return outputs
+
 if __name__ == '__main__':
     mode = sys.argv[1]
     model = sys.argv[2]
     dataset = sys.argv[3]
+    framework = sys.argv[4] if len(sys.argv) > 4 else 'pytorch'  # Default to PyTorch
+    
     if mode == 'train':
-        train(dataset_dict[dataset][0])
+        train(dataset_dict[dataset][0], framework)
     elif mode == 'test_sample':
         print("prompt_outputs len", len(prompt_outputs))
-        test_sample('inverters/gpt3-5_synthetic_prompt_model', prompt_outputs)
+        test_sample('inverters/gpt3-5_synthetic_prompt_model', prompt_outputs, framework)
     else:
-        test(inverters[model], dataset_dict[dataset][1])
+        test(inverters[model], dataset_dict[dataset][1], framework)
